@@ -1,0 +1,43 @@
+# Build directories
+build/
+Builds/
+cmake-build-*/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.dylib
+*.so
+*.dll
+*.a
+*.lib
+
+# JUCE specific
+JuceLibraryCode/
+*.jucer.bak
+
+# Audio files (for testing)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aiff
+*.aif
+
+# Session files
+*.session
+
+# OS specific
+Thumbs.db
+.directory
