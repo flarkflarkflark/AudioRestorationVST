@@ -48,6 +48,14 @@ jobs:
     - name: Build
       run: cmake --build build --config Release -j$(nproc)
 
+    - name: List build artifacts (debug)
+      run: |
+        echo "=== Full build directory structure ==="
+        ls -R build/ || true
+        echo ""
+        echo "=== Looking for VST3 and executables ==="
+        find build -name "*.vst3" -o -type f -executable || true
+
     - name: Upload VST3 (Linux)
       uses: actions/upload-artifact@v4
       with:
@@ -120,6 +128,14 @@ jobs:
 
     - name: Build
       run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+    - name: List build artifacts (debug)
+      run: |
+        echo "=== Full build directory structure ==="
+        Get-ChildItem -Recurse build\ | Select-Object FullName
+        echo ""
+        echo "=== Looking for VST3 and executables ==="
+        Get-ChildItem -Recurse build\ -Include *.vst3,*.exe | Select-Object FullName
 
     - name: Upload VST3 (Windows)
       uses: actions/upload-artifact@v4
