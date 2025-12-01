@@ -77,7 +77,15 @@ jobs:
       run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
 
     - name: List build artifacts (debug)
-      run: find build/AudioRestoration_artefacts -type f || true
+      run: |
+        echo "=== Full build directory structure ==="
+        ls -R build/ || true
+        echo ""
+        echo "=== Looking for VST3 and app bundles ==="
+        find build -name "*.vst3" -o -name "*.app" || true
+        echo ""
+        echo "=== AudioRestoration_artefacts directory ==="
+        find build/AudioRestoration_artefacts -type f || true
 
     - name: Upload VST3 (macOS)
       uses: actions/upload-artifact@v4
