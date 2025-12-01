@@ -37,7 +37,7 @@ jobs:
           libxinerama-dev \
           libxrandr-dev \
           libxrender-dev \
-          libwebkit2gtk-4.0-dev \
+          libwebkit2gtk-4.1-dev \
           libglu1-mesa-dev \
           mesa-common-dev \
           libgtk-3-dev
@@ -76,17 +76,26 @@ jobs:
     - name: Build
       run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
 
+    - name: List build artifacts (debug)
+      run: find build/AudioRestoration_artefacts -type f || true
+
     - name: Upload VST3 (macOS)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-macOS-VST3
-        path: build/AudioRestoration_artefacts/VST3/
+        path: |
+          build/AudioRestoration_artefacts/VST3/
+          build/AudioRestoration_artefacts/Release/VST3/
+        if-no-files-found: warn
 
     - name: Upload Standalone (macOS)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-macOS-Standalone
-        path: build/AudioRestoration_artefacts/Standalone/
+        path: |
+          build/AudioRestoration_artefacts/Standalone/
+          build/AudioRestoration_artefacts/Release/Standalone/
+        if-no-files-found: warn
 
   build-windows:
     name: Build on Windows
