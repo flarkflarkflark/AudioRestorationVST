@@ -1,0 +1,112 @@
+name: Build Audio Restoration Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libasound2-dev \
+          libjack-jackd2-dev \
+          libcurl4-openssl-dev \
+          libfreetype6-dev \
+          libx11-dev \
+          libxcomposite-dev \
+          libxcursor-dev \
+          libxext-dev \
+          libxinerama-dev \
+          libxrandr-dev \
+          libxrender-dev \
+          libwebkit2gtk-4.0-dev \
+          libglu1-mesa-dev \
+          mesa-common-dev
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release -j$(nproc)
+
+    - name: Upload VST3 (Linux)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-Linux-VST3
+        path: build/AudioRestoration_artefacts/VST3/
+
+    - name: Upload Standalone (Linux)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-Linux-Standalone
+        path: build/AudioRestoration_artefacts/Standalone/
+
+  build-macos:
+    name: Build on macOS
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
+
+    - name: Upload VST3 (macOS)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-macOS-VST3
+        path: build/AudioRestoration_artefacts/VST3/
+
+    - name: Upload Standalone (macOS)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-macOS-Standalone
+        path: build/AudioRestoration_artefacts/Standalone/
+
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+    - name: Upload VST3 (Windows)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-Windows-VST3
+        path: build/AudioRestoration_artefacts/Release/VST3/
+
+    - name: Upload Standalone (Windows)
+      uses: actions/upload-artifact@v4
+      with:
+        name: AudioRestoration-Windows-Standalone
+        path: build/AudioRestoration_artefacts/Release/Standalone/
