@@ -61,8 +61,8 @@ jobs:
     - name: Package artifacts (Linux/macOS)
       if: matrix.os != 'windows-latest'
       run: |
-        cd build/AudioRestoration_artefacts
-        tar -czf ../../AudioRestoration-${{ matrix.artifact_name }}.tar.gz VST3/ Standalone/
+        cd build/AudioRestoration_artefacts/Release
+        tar -czf ../../../AudioRestoration-${{ matrix.artifact_name }}.tar.gz VST3/ Standalone/
 
     - name: Package artifacts (Windows)
       if: matrix.os == 'windows-latest'

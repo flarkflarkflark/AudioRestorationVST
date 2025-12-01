@@ -60,13 +60,13 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-VST3
-        path: build/AudioRestoration_artefacts/VST3/
+        path: build/AudioRestoration_artefacts/Release/VST3/
 
     - name: Upload Standalone (Linux)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-Standalone
-        path: build/AudioRestoration_artefacts/Standalone/
+        path: build/AudioRestoration_artefacts/Release/Standalone/
 
   build-macos:
     name: Build on macOS
