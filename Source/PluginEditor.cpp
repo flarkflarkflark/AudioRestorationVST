@@ -8,7 +8,7 @@ AudioRestorationEditor::AudioRestorationEditor (AudioRestorationProcessor& p)
     // Set editor size - fully scalable and resizable
     setSize (950, 800);
     setResizable (true, true);
-    setResizeLimits (640, 480, 2560, 1440); // Min 640x480, max supports 1440p displays
+    setResizeLimits (500, 400, 2560, 1440); // Min 500x400, max supports 1440p displays
 
     //==============================================================================
     // Global Controls - Difference Mode
