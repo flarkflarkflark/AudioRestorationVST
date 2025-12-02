@@ -1,0 +1,34 @@
+{
+  "name": "@flarkflarkflark/audio-restoration",
+  "version": "1.0.0",
+  "description": "Professional audio restoration VST3 and Standalone application",
+  "main": "index.js",
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flarkflarkflark/AudioRestorationVST.git"
+  },
+  "publishConfig": {
+    "@flarkflarkflark:registry": "https://npm.pkg.github.com"
+  },
+  "keywords": [
+    "audio",
+    "vst3",
+    "restoration",
+    "plugin",
+    "noise-reduction",
+    "click-removal",
+    "eq",
+    "dsp"
+  ],
+  "author": "Flark Audio",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/flarkflarkflark/AudioRestorationVST/issues"
+  },
+  "homepage": "https://github.com/flarkflarkflark/AudioRestorationVST#readme"
+}
