@@ -65,20 +65,33 @@ jobs:
     - name: Package artifacts (Linux/macOS)
       if: matrix.os != 'windows-latest'
       run: |
-        cd build/AudioRestoration_artefacts/Release
-        tar -czf ../../../AudioRestoration-${{ matrix.artifact_name }}.tar.gz VST3/ Standalone/
+        cd build
+        # Find the artefacts directory (handles both old and new naming)
+        ARTEFACTS=$(ls -d *_artefacts 2>/dev/null | head -1)
+        if [ -d "$ARTEFACTS" ]; then
+          cd "$ARTEFACTS"
+          tar -czf ../../VinylRestorationSuite-${{ matrix.artifact_name }}.tar.gz VST3/ Standalone/ || tar -czf ../../VinylRestorationSuite-${{ matrix.artifact_name }}.tar.gz */
+        fi
 
     - name: Package artifacts (Windows)
       if: matrix.os == 'windows-latest'
+      shell: pwsh
       run: |
-        cd build/AudioRestoration_artefacts/Release
-        Compress-Archive -Path VST3/,Standalone/ -DestinationPath ../../../AudioRestoration-Windows.zip
+        cd build
+        $artefacts = Get-ChildItem -Directory -Filter "*_artefacts" | Select-Object -First 1
+        if ($artefacts) {
+          cd $artefacts.FullName
+          $items = Get-ChildItem -Directory | Where-Object { $_.Name -match 'VST3|Standalone' }
+          if ($items) {
+            Compress-Archive -Path $items.FullName -DestinationPath "../../VinylRestorationSuite-Windows.zip"
+          }
+        }
 
     - name: Upload Release Assets (Linux/macOS)
       if: matrix.os != 'windows-latest'
       uses: softprops/action-gh-release@v1
       with:
-        files: AudioRestoration-${{ matrix.artifact_name }}.tar.gz
+        files: VinylRestorationSuite-${{ matrix.artifact_name }}.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -86,7 +99,7 @@ jobs:
       if: matrix.os == 'windows-latest'
       uses: softprops/action-gh-release@v1
       with:
-        files: AudioRestoration-Windows.zip
+        files: VinylRestorationSuite-Windows.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
