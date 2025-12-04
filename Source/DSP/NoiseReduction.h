@@ -59,17 +59,28 @@ public:
 
     void process (juce::dsp::ProcessContextReplacing<float>& context)
     {
+        auto& block = context.getOutputBlock();
+
+        // Capture profile if requested
+        if (isCapturingProfile)
+        {
+            captureProfileFromBlock (block);
+            return; // Don't process during capture
+        }
+
+        // Bypass if no profile or zero reduction
         if (!profileCaptured || reductionAmount <= 0.0f)
         {
-            // Bypass if no profile or zero reduction
             return;
         }
 
-        auto& block = context.getOutputBlock();
-
-        // TODO: Implement overlap-add FFT processing
-        // For now, bypass
-        // processSpectralSubtraction (block);
+        // Process each channel independently
+        for (size_t channel = 0; channel < block.getNumChannels(); ++channel)
+        {
+            processSpectralSubtraction (block.getChannelPointer (channel),
+                                       block.getNumSamples(),
+                                       static_cast<int> (channel));
+        }
     }
 
     //==============================================================================
@@ -98,38 +109,213 @@ public:
         profileCaptured = false;
     }
 
+    /** Get activity metrics for visual feedback */
+    bool isActivelyReducing() const { return profileCaptured && reductionAmount > 0.1f; }
+    float getReductionAmount() const { return reductionAmount; }
+
 private:
     //==============================================================================
-    void processSpectralSubtraction (juce::dsp::AudioBlock<float>& block)
+    void processSpectralSubtraction (float* channelData, size_t numSamples, int channel)
     {
-        // TODO: Implement spectral subtraction
-        // Algorithm:
-        // 1. Apply windowing
-        // 2. FFT
-        // 3. Compute magnitude spectrum
-        // 4. Subtract noise profile from magnitude
-        // 5. Apply spectral floor
-        // 6. Reconstruct with original phase
-        // 7. IFFT
-        // 8. Overlap-add with previous frame
+        // Overlap-add FFT processing for spectral subtraction
+        // Process in frames with 75% overlap for smooth reconstruction
+
+        for (size_t pos = 0; pos < numSamples; pos += hopSize)
+        {
+            // Calculate frame boundaries
+            size_t frameEnd = juce::jmin (pos + fftSize, numSamples);
+            size_t frameSamples = frameEnd - pos;
+
+            if (frameSamples < static_cast<size_t> (hopSize))
+                break; // Not enough samples for another frame
+
+            // 1. Copy and window the input frame
+            std::fill (fftBuffer.begin(), fftBuffer.end(), 0.0f);
+            for (size_t i = 0; i < frameSamples; ++i)
+            {
+                fftBuffer[i] = channelData[pos + i] * windowBuffer[i];
+            }
+
+            // 2. Forward FFT (real to complex)
+            fft->performRealOnlyForwardTransform (fftBuffer.data());
+
+            // 3. Spectral subtraction
+            performSpectralSubtraction();
+
+            // 4. Inverse FFT (complex to real)
+            fft->performRealOnlyInverseTransform (fftBuffer.data());
+
+            // 5. Overlap-add with output windowing
+            // For 75% overlap (4x overlap) with Hann window, normalization factor is 1.5
+            const float normFactor = 1.5f;
+
+            for (size_t i = 0; i < frameSamples; ++i)
+            {
+                if (pos + i < numSamples)
+                {
+                    // Apply window and normalize for overlap-add
+                    channelData[pos + i] = fftBuffer[i] * windowBuffer[i] / (fftSize * normFactor);
+
+                    // Add overlap from previous frame
+                    if (channel < overlapBuffer.getNumChannels() && i < static_cast<size_t> (overlapBuffer.getNumSamples()))
+                    {
+                        channelData[pos + i] += overlapBuffer.getSample (channel, static_cast<int> (i));
+                    }
+                }
+            }
+
+            // 6. Store overlap for next frame
+            if (channel < overlapBuffer.getNumChannels())
+            {
+                for (int i = 0; i < overlapBuffer.getNumSamples(); ++i)
+                {
+                    if (static_cast<size_t> (i) + hopSize < frameSamples)
+                    {
+                        overlapBuffer.setSample (channel, i,
+                            fftBuffer[i + hopSize] * windowBuffer[i + hopSize] / (fftSize * normFactor));
+                    }
+                    else
+                    {
+                        overlapBuffer.setSample (channel, i, 0.0f);
+                    }
+                }
+            }
+        }
+    }
+
+    void performSpectralSubtraction()
+    {
+        // Process magnitude spectrum: subtract noise profile
+        // Complex FFT output format: [real0, real1, ..., realN/2, imag1, ..., imagN/2-1]
+
+        int numBins = fftSize / 2 + 1;
+
+        for (int bin = 0; bin < numBins; ++bin)
+        {
+            float real, imag;
+
+            // Extract real and imaginary parts from JUCE FFT format
+            if (bin == 0)
+            {
+                real = fftBuffer[0];
+                imag = 0.0f;
+            }
+            else if (bin == fftSize / 2)
+            {
+                real = fftBuffer[fftSize / 2];
+                imag = 0.0f;
+            }
+            else
+            {
+                real = fftBuffer[bin];
+                imag = fftBuffer[fftSize - bin];
+            }
+
+            // Calculate magnitude and phase
+            float magnitude = std::sqrt (real * real + imag * imag);
+            float phase = std::atan2 (imag, real);
+
+            // Spectral subtraction with over-subtraction factor
+            float noiseMag = noiseProfile[static_cast<size_t> (bin)] * reductionLinear;
+            float cleanMag = magnitude - noiseMag;
+
+            // Apply spectral floor to prevent musical noise
+            cleanMag = juce::jmax (cleanMag, magnitude * spectralFloor);
+
+            // Reconstruct complex number with cleaned magnitude and original phase
+            real = cleanMag * std::cos (phase);
+            imag = cleanMag * std::sin (phase);
+
+            // Store back in JUCE FFT format
+            if (bin == 0)
+            {
+                fftBuffer[0] = real;
+            }
+            else if (bin == fftSize / 2)
+            {
+                fftBuffer[fftSize / 2] = real;
+            }
+            else
+            {
+                fftBuffer[bin] = real;
+                fftBuffer[fftSize - bin] = imag;
+            }
+        }
     }
 
     void captureProfileFromBlock (const juce::dsp::AudioBlock<float>& block)
     {
-        // TODO: Accumulate FFT magnitude spectra for profile
-        if (isCapturingProfile && profileCaptureFrames < maxCaptureFrames)
+        if (!isCapturingProfile || profileCaptureFrames >= maxCaptureFrames)
+            return;
+
+        // Average noise profile across all channels
+        for (size_t channel = 0; channel < block.getNumChannels(); ++channel)
         {
-            // Process and average multiple frames
-            profileCaptureFrames++;
+            const float* channelData = block.getChannelPointer (channel);
+            size_t numSamples = block.getNumSamples();
 
-            if (profileCaptureFrames >= maxCaptureFrames)
+            // Process each frame in the block
+            for (size_t pos = 0; pos < numSamples && profileCaptureFrames < maxCaptureFrames; pos += hopSize)
             {
-                // Normalize averaged profile
-                for (auto& val : noiseProfile)
-                    val /= static_cast<float> (maxCaptureFrames);
+                size_t frameEnd = juce::jmin (pos + fftSize, numSamples);
+                size_t frameSamples = frameEnd - pos;
 
-                profileCaptured = true;
-                isCapturingProfile = false;
+                if (frameSamples < static_cast<size_t> (fftSize / 2))
+                    break;
+
+                // Copy and window the frame
+                std::fill (fftBuffer.begin(), fftBuffer.end(), 0.0f);
+                for (size_t i = 0; i < frameSamples; ++i)
+                {
+                    fftBuffer[i] = channelData[pos + i] * windowBuffer[i];
+                }
+
+                // Forward FFT
+                fft->performRealOnlyForwardTransform (fftBuffer.data());
+
+                // Accumulate magnitude spectrum
+                int numBins = fftSize / 2 + 1;
+                for (int bin = 0; bin < numBins; ++bin)
+                {
+                    float real, imag;
+
+                    // Extract real and imaginary parts
+                    if (bin == 0)
+                    {
+                        real = fftBuffer[0];
+                        imag = 0.0f;
+                    }
+                    else if (bin == fftSize / 2)
+                    {
+                        real = fftBuffer[fftSize / 2];
+                        imag = 0.0f;
+                    }
+                    else
+                    {
+                        real = fftBuffer[bin];
+                        imag = fftBuffer[fftSize - bin];
+                    }
+
+                    // Accumulate magnitude
+                    float magnitude = std::sqrt (real * real + imag * imag);
+                    noiseProfile[static_cast<size_t> (bin)] += magnitude;
+                }
+
+                profileCaptureFrames++;
+
+                // Check if we've captured enough
+                if (profileCaptureFrames >= maxCaptureFrames)
+                {
+                    // Normalize averaged profile
+                    for (auto& val : noiseProfile)
+                    {
+                        val /= static_cast<float> (maxCaptureFrames);
+                    }
+
+                    profileCaptured = true;
+                    isCapturingProfile = false;
+                    return;
+                }
             }
         }
     }

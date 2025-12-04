@@ -2,6 +2,8 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PluginProcessor.h"
+#include "GUI/GlowingKnobLookAndFeel.h"
+// #include "GUI/SpectrumAnalyzer.h"  // Removed per user request
 
 //==============================================================================
 /**
@@ -14,7 +16,8 @@
  * - Correction list view (standalone)
  * - Real-time spectrum analyzer
  */
-class AudioRestorationEditor  : public juce::AudioProcessorEditor
+class AudioRestorationEditor  : public juce::AudioProcessorEditor,
+                                 private juce::Timer
 {
 public:
     AudioRestorationEditor (AudioRestorationProcessor&);
@@ -24,13 +27,29 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    //==============================================================================
+    // Interface Scaling
+    void setScaleFactor (float newScale);
+    float getScaleFactor() const { return scaleFactor; }
+
+    //==============================================================================
+    // Visual Feedback Timer
+    void timerCallback() override;
+
 private:
     AudioRestorationProcessor& audioProcessor;
+
+    // Interface scaling
+    float scaleFactor = 1.0f;
+    static constexpr int baseWidth = 950;
+    static constexpr int baseHeight = 800;
 
     //==============================================================================
     // UI Components
 
     // Global Controls
+    juce::ComboBox scaleSelector;
+    juce::Label scaleLabel;
     juce::ToggleButton differenceModeButton;
     juce::Label differenceModeLabel;
 
@@ -58,13 +77,16 @@ private:
 
     // Graphic EQ Section
     juce::GroupComponent eqGroup;
+    juce::ToggleButton eqBypassButton;
     std::vector<std::unique_ptr<juce::Slider>> eqSliders;
     std::vector<std::unique_ptr<juce::Label>> eqLabels;
 
     // Parameter attachments
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
+    using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
 
+    std::unique_ptr<ComboBoxAttachment> scaleAttachment;
     std::unique_ptr<ButtonAttachment> differenceModeAttachment;
     std::unique_ptr<SliderAttachment> clickSensitivityAttachment;
     std::unique_ptr<ButtonAttachment> clickBypassAttachment;
@@ -75,7 +97,21 @@ private:
     std::unique_ptr<SliderAttachment> humAttachment;
     std::unique_ptr<ButtonAttachment> humBypassAttachment;
 
+    std::unique_ptr<ButtonAttachment> eqBypassAttachment;
     std::vector<std::unique_ptr<SliderAttachment>> eqAttachments;
+
+    // Custom LookAndFeel for glowing knobs
+    GlowingKnobLookAndFeel clickKnobLAF;
+    GlowingKnobLookAndFeel noiseKnobLAF;
+    GlowingKnobLookAndFeel rumbleKnobLAF;
+    GlowingKnobLookAndFeel humKnobLAF;
+    std::vector<std::unique_ptr<GlowingKnobLookAndFeel>> eqKnobLAFs;
+
+    // Spectrum Analyzer removed per user request
+    // SpectrumAnalyzer spectrumAnalyzer;
+
+    // Logo image
+    juce::Image logoImage;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioRestorationEditor)
 };

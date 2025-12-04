@@ -32,6 +32,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AudioRestorationProcessor::c
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
     // Global parameters
+    layout.add (std::make_unique<juce::AudioParameterChoice> (
+        "uiScale",
+        "UI Scale",
+        juce::StringArray {"25%", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"},
+        3)); // Default to 100% (index 3)
+
     layout.add (std::make_unique<juce::AudioParameterBool> (
         "differenceMode",
         "Difference Mode",
@@ -85,6 +91,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AudioRestorationProcessor::c
     layout.add (std::make_unique<juce::AudioParameterBool> (
         "humBypass",
         "Hum Bypass",
+        true));
+
+    // Graphic EQ bypass
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        "eqBypass",
+        "EQ Bypass",
         true));
 
     // Graphic EQ bands (10 bands)
@@ -252,20 +264,27 @@ void AudioRestorationProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
     // 3. Filter bank (rumble, hum, EQ)
     bool rumbleBypass = *parameters.getRawParameterValue ("rumbleBypass") > 0.5f;
     bool humBypass = *parameters.getRawParameterValue ("humBypass") > 0.5f;
+    bool eqBypass = *parameters.getRawParameterValue ("eqBypass") > 0.5f;
 
-    filterBank.setRumbleFilter (*rumbleFilterParam, !rumbleBypass);
-    filterBank.setHumFilter (*humFilterParam, !humBypass);
+    filterBank.setRumbleFilter (*rumbleFilterParam, rumbleBypass);
+    filterBank.setHumFilter (*humFilterParam, humBypass);
 
-    // Update EQ bands and check if any are active
+    // Update EQ bands and check if any are active (only if EQ not bypassed)
     bool anyEQActive = false;
-    for (int i = 0; i < 10; ++i)
+    if (!eqBypass)
     {
-        auto paramID = "eqBand" + juce::String (i);
-        float gain = *parameters.getRawParameterValue (paramID);
-        filterBank.setEQBand (i, gain);
-        if (std::abs (gain) > 0.01f)
-            anyEQActive = true;
+        for (int i = 0; i < 10; ++i)
+        {
+            auto paramID = "eqBand" + juce::String (i);
+            float gain = *parameters.getRawParameterValue (paramID);
+            filterBank.setEQBand (i, gain);
+            if (std::abs (gain) > 0.01f)
+                anyEQActive = true;
+        }
     }
+
+    // ALWAYS measure band activity for visual feedback (regardless of bypass state)
+    filterBank.measureBandActivityForMetering (block);
 
     // Only process filterbank if something is enabled
     if (!rumbleBypass || !humBypass || anyEQActive)
@@ -287,6 +306,9 @@ void AudioRestorationProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
             }
         }
     }
+
+    // Store a copy of the processed audio for spectrum analyzer visualization
+    visualizationBuffer.makeCopyOf (buffer);
 }
 
 //==============================================================================

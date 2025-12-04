@@ -66,6 +66,9 @@ public:
     NoiseReduction& getNoiseReduction() { return noiseReduction; }
     FilterBank& getFilterBank() { return filterBank; }
 
+    // Get audio for spectrum analyzer visualization
+    const juce::AudioBuffer<float>& getVisualizationBuffer() const { return visualizationBuffer; }
+
 private:
     //==============================================================================
     // Parameter management
@@ -81,6 +84,9 @@ private:
     std::atomic<float>* noiseReductionParam = nullptr;
     std::atomic<float>* rumbleFilterParam = nullptr;
     std::atomic<float>* humFilterParam = nullptr;
+
+    // Audio buffer for spectrum analyzer visualization
+    juce::AudioBuffer<float> visualizationBuffer;
 
     // Create parameter layout
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
