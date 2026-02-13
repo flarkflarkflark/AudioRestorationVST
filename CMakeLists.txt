@@ -4,7 +4,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(VinylRestorationSuite VERSION 1.6.1)
+project(VinylRestorationSuite VERSION 1.6.2)
 
 # Add JUCE as a subdirectory (using local submodule)
 add_subdirectory(JUCE)
@@ -398,7 +398,13 @@ if(ENABLE_ONNX_RUNTIME)
             list(APPEND ONNXRUNTIME_RUNTIME_LIBS "${ONNXRUNTIME_LIBRARY}")
         endif()
         if(ONNXRUNTIME_USE_COREML)
-            list(APPEND ONNXRUNTIME_COMPILE_DEFINITIONS ONNX_RUNTIME_USE_COREML=1)
+            set(ONNXRUNTIME_COREML_HEADER "${ONNXRUNTIME_DIR}/include/coreml_provider_factory.h")
+            if(EXISTS "${ONNXRUNTIME_COREML_HEADER}")
+                list(APPEND ONNXRUNTIME_COMPILE_DEFINITIONS ONNX_RUNTIME_USE_COREML=1)
+            else()
+                message(WARNING "CoreML provider header not found; disabling CoreML EP.")
+                set(ONNXRUNTIME_USE_COREML OFF)
+            endif()
         endif()
     else()
         set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so")
@@ -475,7 +481,7 @@ option(VRS_COPY_PLUGIN_AFTER_BUILD "Copy VST3 to system folder after build" OFF)
 
 # Add the plugin target (VST3 only)
 juce_add_plugin(VinylRestorationSuite
-    PRODUCT_NAME "Vinyl Restoration Suite v1.6.1"
+    PRODUCT_NAME "Vinyl Restoration Suite v1.6.2"
     COMPANY_NAME "flarkAUDIO"
     PLUGIN_MANUFACTURER_CODE Flrk
     PLUGIN_CODE Vrs1

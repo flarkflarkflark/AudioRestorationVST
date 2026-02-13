@@ -6,6 +6,17 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(ONNX_RUNTIME_USE_COREML)
+#if __has_include(<coreml_provider_factory.h>)
+#include <coreml_provider_factory.h>
+#define VRS_HAS_COREML_PROVIDER_HEADER 1
+#else
+#define VRS_HAS_COREML_PROVIDER_HEADER 0
+#endif
+#else
+#define VRS_HAS_COREML_PROVIDER_HEADER 0
+#endif
+
 #if defined(ONNX_RUNTIME_USE_DML) && JUCE_WINDOWS
 using DmlAppendFn = OrtStatus* (ORT_API_CALL*) (OrtSessionOptions*, int);
 
@@ -444,7 +455,7 @@ bool OnnxDenoiser::tryCreateSessionForProvider (const juce::File& file, Provider
         }
         else if (provider == Provider::coreml)
         {
-           #if defined(ONNX_RUNTIME_USE_COREML)
+           #if defined(ONNX_RUNTIME_USE_COREML) && VRS_HAS_COREML_PROVIDER_HEADER
             OrtSessionOptionsAppendExecutionProvider_CoreML (sessionOptions, 0);
            #else
             providerReady = false;
@@ -702,7 +713,7 @@ bool OnnxDenoiser::isProviderUsable (Provider provider) const
 
     if (provider == Provider::coreml)
     {
-       #if defined(ONNX_RUNTIME_USE_COREML)
+       #if defined(ONNX_RUNTIME_USE_COREML) && VRS_HAS_COREML_PROVIDER_HEADER
         return true;
        #else
         return false;
