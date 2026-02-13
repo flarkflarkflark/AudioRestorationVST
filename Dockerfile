@@ -11,7 +11,7 @@ RUN apk add --no-cache tar gzip
 RUN mkdir -p /opt/audio-restoration
 
 # Copy build artifacts (these will be available during GitHub Actions)
-COPY build/AudioRestoration_artefacts/Release/ /opt/audio-restoration/
+COPY build/*_artefacts/Release/ /opt/audio-restoration/
 
 WORKDIR /opt/audio-restoration
 
