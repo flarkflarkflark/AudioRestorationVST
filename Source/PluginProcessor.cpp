@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Utils/SettingsManager.h"
 
 //==============================================================================
 AudioRestorationProcessor::AudioRestorationProcessor()
@@ -20,6 +21,8 @@ AudioRestorationProcessor::AudioRestorationProcessor()
     noiseReductionParam = parameters.getRawParameterValue ("noiseReduction");
     rumbleFilterParam = parameters.getRawParameterValue ("rumbleFilter");
     humFilterParam = parameters.getRawParameterValue ("humFilter");
+    aiDenoiseEnableParam = parameters.getRawParameterValue ("aiDenoiseEnable");
+    aiDenoiseMixParam = parameters.getRawParameterValue ("aiDenoiseMix");
 }
 
 AudioRestorationProcessor::~AudioRestorationProcessor()
@@ -67,6 +70,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout AudioRestorationProcessor::c
         "noiseBypass",
         "Noise Bypass",
         false));
+
+    // AI denoise parameters
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        "aiDenoiseEnable",
+        "AI Denoise Enable",
+        false));
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        "aiDenoiseMix",
+        "AI Denoise Mix",
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f),
+        1.0f));
 
     // Filter parameters
     layout.add (std::make_unique<juce::AudioParameterFloat> (
@@ -183,6 +198,10 @@ void AudioRestorationProcessor::changeProgramName (int index, const juce::String
 //==============================================================================
 void AudioRestorationProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    lastSampleRate = sampleRate;
+    lastBlockSize = samplesPerBlock;
+    lastNumChannels = getTotalNumOutputChannels();
+
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
@@ -192,6 +211,8 @@ void AudioRestorationProcessor::prepareToPlay (double sampleRate, int samplesPer
     clickRemoval.prepare (spec);
     noiseReduction.prepare (spec);
     filterBank.prepare (spec);
+    applyDenoiserSettings();
+    onnxDenoiser.prepare (sampleRate, getTotalNumOutputChannels(), samplesPerBlock);
 }
 
 void AudioRestorationProcessor::releaseResources()
@@ -199,6 +220,24 @@ void AudioRestorationProcessor::releaseResources()
     clickRemoval.reset();
     noiseReduction.reset();
     filterBank.reset();
+    onnxDenoiser.reset();
+}
+
+void AudioRestorationProcessor::applyDenoiserSettings()
+{
+    const auto settings = SettingsManager::getInstance().getDenoiseSettings();
+    onnxDenoiser.setPreferredProvider (OnnxDenoiser::providerFromString (settings.provider));
+    onnxDenoiser.setAllowFallback (settings.allowFallback);
+    onnxDenoiser.setDmlDeviceId (settings.dmlDeviceId);
+    onnxDenoiser.setQnnBackendPath (settings.qnnBackendPath);
+
+    if (settings.modelPath.isNotEmpty())
+        onnxDenoiser.setModelPath (juce::File (settings.modelPath));
+    else
+        onnxDenoiser.clearModelPath();
+
+    if (lastSampleRate > 0.0 && lastBlockSize > 0)
+        onnxDenoiser.prepare (lastSampleRate, lastNumChannels, lastBlockSize);
 }
 
 #ifndef JucePlugin_PreferredChannelConfigurations
@@ -259,6 +298,17 @@ void AudioRestorationProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
     {
         noiseReduction.setReduction (*noiseReductionParam);
         noiseReduction.process (context);
+    }
+
+    // 2b. AI denoise (optional)
+    if (aiDenoiseEnableParam != nullptr && aiDenoiseEnableParam->load() > 0.5f)
+    {
+        onnxDenoiser.setEnabled (true);
+        onnxDenoiser.processBlock (buffer, aiDenoiseMixParam != nullptr ? aiDenoiseMixParam->load() : 1.0f);
+    }
+    else
+    {
+        onnxDenoiser.setEnabled (false);
     }
 
     // 3. Filter bank (rumble, hum, EQ)

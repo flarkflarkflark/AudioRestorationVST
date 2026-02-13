@@ -54,6 +54,10 @@ public:
     /** Set FFT size (must be power of 2, default: 2048) */
     void setFftSize (int newSize);
 
+    /** Show/hide axes and dB scale (useful for compact previews) */
+    void setShowAxes (bool shouldShowAxes);
+    bool getShowAxes() const { return showAxes; }
+
     /** Get analysis progress (0.0 to 1.0) */
     float getProgress() const { return analysisProgress.load(); }
 
@@ -98,6 +102,7 @@ private:
     Palette currentPalette = Palette::Spectrum;
     float lowerDbRange = -120.0f;
     float upperDbRange = 0.0f;
+    bool showAxes = true;
 
     // Margins for axes
     static constexpr int leftMargin = 50;    // Frequency axis

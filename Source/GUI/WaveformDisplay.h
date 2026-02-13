@@ -55,6 +55,9 @@ public:
     /** Set callback for when selection changes */
     std::function<void(int64_t start, int64_t end)> onSelectionChanged;
 
+    /** Zoom view to current selection */
+    bool zoomToSelection();
+
     /** Set callback for context menu process actions */
     std::function<void(int actionId)> onProcessAction;
 
@@ -127,6 +130,7 @@ public:
 
 private:
     void drawWaveform (juce::Graphics& g, const juce::Rectangle<int>& bounds);
+    void drawTimeRuler (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawClickMarkers (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawPlaybackCursor (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawSelection (juce::Graphics& g, const juce::Rectangle<int>& bounds);
@@ -146,6 +150,14 @@ private:
     int64_t selectionStart = -1;
     int64_t selectionEnd = -1;
     bool isDragging = false;
+    bool isHandleDrag = false;
+    enum class HandleDrag
+    {
+        none,
+        start,
+        end
+    };
+    HandleDrag activeHandle = HandleDrag::none;
 
     // Drag interactions
     juce::Point<float> dragStartPosition;
@@ -156,6 +168,9 @@ private:
     double initialVerticalZoom = 1.0;
     double initialScrollPosition = 0.0;
     double zoomCenterPosition = 0.0;     // Position (0-1) to zoom around
+
+    static constexpr int timeRulerHeight = 18;
+    static constexpr int selectionHandleWidth = 6;
 
     // OpenGL hardware acceleration (optional, auto-detects)
     juce::OpenGLContext openGLContext;

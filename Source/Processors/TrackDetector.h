@@ -59,6 +59,12 @@ public:
     /** Clear all boundaries */
     void clearBoundaries();
 
+    /** Replace boundaries (used for external detection workflows) */
+    void setBoundaries (const std::vector<TrackBoundary>& newBoundaries);
+
+    /** Set track names (in order) for export */
+    void setTrackNames (const juce::StringArray& names);
+
     /** Split audio buffer into separate track buffers based on boundaries */
     std::vector<juce::AudioBuffer<float>> splitIntoTracks (const juce::AudioBuffer<float>& buffer,
                                                            double sampleRate,
@@ -83,6 +89,7 @@ private:
     void sortBoundaries();
 
     std::vector<TrackBoundary> boundaries;
+    juce::StringArray trackNames;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TrackDetector)
 };

@@ -99,6 +99,15 @@ public:
         reductionLinear = juce::Decibels::decibelsToGain (reductionAmount);
     }
 
+    /** Enable adaptive noise profile updates during processing */
+    void setAdaptiveEnabled (bool enabled) { adaptiveEnabled = enabled; }
+
+    /** Set adaptive profile update rate (0.0 to 0.2) */
+    void setAdaptiveRate (float rate)
+    {
+        adaptiveRate = juce::jlimit (0.0f, 0.2f, rate);
+    }
+
     /** Check if noise profile has been captured */
     bool hasProfile() const { return profileCaptured; }
 
@@ -214,6 +223,14 @@ private:
             // Calculate magnitude and phase
             float magnitude = std::sqrt (real * real + imag * imag);
             float phase = std::atan2 (imag, real);
+
+            // Adaptive noise profile update (only when likely noise-dominant)
+            if (adaptiveEnabled && profileCaptured && adaptiveRate > 0.0f)
+            {
+                float profile = noiseProfile[static_cast<size_t> (bin)];
+                if (magnitude <= profile * adaptiveThreshold)
+                    noiseProfile[static_cast<size_t> (bin)] = profile + adaptiveRate * (magnitude - profile);
+            }
 
             // Spectral subtraction with over-subtraction factor
             float noiseMag = noiseProfile[static_cast<size_t> (bin)] * reductionLinear;
@@ -347,6 +364,9 @@ private:
     float reductionAmount = 0.0f;
     float reductionLinear = 1.0f;
     const float spectralFloor = 0.01f; // -40 dB
+    bool adaptiveEnabled = false;
+    float adaptiveRate = 0.0f;
+    const float adaptiveThreshold = 1.5f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NoiseReduction)
 };

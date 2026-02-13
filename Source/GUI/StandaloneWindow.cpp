@@ -1,8 +1,590 @@
 #include "StandaloneWindow.h"
+#include "SettingsComponent.h"
+#include <array>
+#include <atomic>
+#include <functional>
+
+namespace
+{
+    struct ClickDetectionResult
+    {
+        std::vector<ClickRemoval::ClickInfo> clicks;
+        int totalClicks = 0;
+        bool cancelled = false;
+    };
+
+    class ClickDetectionTask : public juce::ThreadWithProgressWindow
+    {
+    public:
+        ClickDetectionTask (const juce::AudioBuffer<float>& source,
+                            double sr,
+                            int startSample,
+                            int endSample,
+                            float sensitivity,
+                            int maxWidth,
+                            ClickRemoval::RemovalMethod method)
+            : juce::ThreadWithProgressWindow ("Detecting clicks...", true, true),
+              sourceBuffer (source),
+              sampleRate (sr),
+              scanStart (startSample),
+              scanEnd (endSample),
+              clickSensitivity (sensitivity),
+              clickMaxWidth (maxWidth),
+              removalMethod (method)
+        {
+        }
+
+        void run() override
+        {
+            if (scanEnd <= scanStart)
+                return;
+
+            const int totalSamples = scanEnd - scanStart;
+            juce::AudioBuffer<float> scanBuffer (sourceBuffer.getNumChannels(), totalSamples);
+            for (int ch = 0; ch < sourceBuffer.getNumChannels(); ++ch)
+                scanBuffer.copyFrom (ch, 0, sourceBuffer, ch, scanStart, totalSamples);
+
+            juce::dsp::ProcessSpec spec;
+            spec.sampleRate = sampleRate;
+            spec.numChannels = static_cast<juce::uint32> (scanBuffer.getNumChannels());
+            spec.maximumBlockSize = 2048;
+
+            ClickRemoval processor;
+            processor.prepare (spec);
+            processor.reset();
+            processor.setSensitivity (clickSensitivity);
+            processor.setMaxWidth (clickMaxWidth);
+            processor.setRemovalMethod (removalMethod);
+            processor.setStoreDetectedClicks (true);
+            processor.setApplyRemoval (false);
+            processor.resetSamplePosition();
+            processor.setSampleOffset (scanStart);
+
+            const int blockSize = 2048;
+            int totalClicks = 0;
+
+            for (int start = 0; start < totalSamples; start += blockSize)
+            {
+                if (threadShouldExit())
+                {
+                    result.cancelled = true;
+                    return;
+                }
+
+                int samplesThisBlock = juce::jmin (blockSize, totalSamples - start);
+                juce::dsp::AudioBlock<float> block (scanBuffer.getArrayOfWritePointers(),
+                                                    static_cast<size_t> (scanBuffer.getNumChannels()),
+                                                    static_cast<size_t> (start),
+                                                    static_cast<size_t> (samplesThisBlock));
+
+                juce::dsp::ProcessContextReplacing<float> context (block);
+                processor.process (context);
+
+                totalClicks += processor.getClicksDetectedLastBlock();
+
+                setProgress (juce::jlimit (0.0, 1.0, (start + samplesThisBlock) / (double) totalSamples));
+            }
+
+            result.totalClicks = totalClicks;
+            result.clicks = processor.getDetectedClicks();
+        }
+
+        void threadComplete (bool userPressedCancel) override
+        {
+            result.cancelled = result.cancelled || userPressedCancel;
+            if (onComplete)
+                onComplete (result);
+            delete this;
+        }
+
+        ClickDetectionResult result;
+        std::function<void (const ClickDetectionResult&)> onComplete;
+
+    private:
+        const juce::AudioBuffer<float>& sourceBuffer;
+        double sampleRate = 0.0;
+        int scanStart = 0;
+        int scanEnd = 0;
+        float clickSensitivity = 0.0f;
+        int clickMaxWidth = 0;
+        ClickRemoval::RemovalMethod removalMethod = ClickRemoval::Automatic;
+    };
+
+    class ClickDetectionApplier : public juce::Timer
+    {
+    public:
+        ClickDetectionApplier (CorrectionListView* listView,
+                               WaveformDisplay* waveformDisplay,
+                               std::vector<ClickRemoval::ClickInfo> clicks,
+                               juce::String rangeInfo,
+                               std::function<void (const juce::String&)> statusSetter,
+                               std::function<void (size_t)> onFinished)
+            : list (listView),
+              waveform (waveformDisplay),
+              pendingClicks (std::move (clicks)),
+              rangeDescription (std::move (rangeInfo)),
+              setStatus (std::move (statusSetter)),
+              finishedCallback (std::move (onFinished))
+        {
+            if (list != nullptr)
+                list->clearCorrections();
+            if (waveform != nullptr)
+                waveform->clearClickMarkers();
+
+            total = pendingClicks.size();
+            progressValue = 0.0;
+
+            progressWindow = std::make_unique<juce::AlertWindow> (
+                "Rendering Click Markers",
+                "Updating the timeline with detected clicks...",
+                juce::AlertWindow::InfoIcon);
+            progressWindow->addProgressBarComponent (progressValue);
+            progressWindow->setEscapeKeyCancels (false);
+            progressWindow->enterModalState (true, nullptr, true);
+
+            startTimerHz (30);
+        }
+
+        void timerCallback() override
+        {
+            if (total == 0)
+            {
+                if (progressWindow)
+                {
+                    progressWindow->exitModalState (0);
+                    progressWindow->setVisible (false);
+                    progressWindow.reset();
+                }
+                stopTimer();
+                if (finishedCallback)
+                    finishedCallback (0);
+                delete this;
+                return;
+            }
+
+            const size_t chunkSize = 500;
+            size_t end = juce::jmin (total, index + chunkSize);
+
+            for (; index < end; ++index)
+            {
+                const auto& click = pendingClicks[index];
+                if (list != nullptr)
+                {
+                    list->addCorrection (click.position,
+                                         click.magnitude,
+                                         click.width,
+                                         click.isManual ? "Manual" : "Auto",
+                                         false);
+                }
+
+                if (waveform != nullptr)
+                    waveform->addClickMarker (click.position);
+            }
+
+            if (setStatus)
+            {
+                int percent = static_cast<int> ((index * 100) / total);
+                setStatus ("Rendering clicks... " + juce::String (percent) + "% (" +
+                          juce::String (index) + "/" + juce::String (total) + ")");
+            }
+
+            progressValue = total > 0 ? (double) index / (double) total : 1.0;
+
+            if (index >= total)
+            {
+                if (progressWindow)
+                {
+                    progressWindow->exitModalState (0);
+                    progressWindow->setVisible (false);
+                    progressWindow.reset();
+                }
+                stopTimer();
+                if (finishedCallback)
+                    finishedCallback (total);
+                delete this;
+            }
+        }
+
+    private:
+        CorrectionListView* list = nullptr;
+        WaveformDisplay* waveform = nullptr;
+        std::vector<ClickRemoval::ClickInfo> pendingClicks;
+        juce::String rangeDescription;
+        std::function<void (const juce::String&)> setStatus;
+        std::function<void (size_t)> finishedCallback;
+        std::unique_ptr<juce::AlertWindow> progressWindow;
+        double progressValue = 0.0;
+        size_t index = 0;
+        size_t total = 0;
+    };
+
+    struct ClickRemovalResult
+    {
+        int totalClicksRemoved = 0;
+        bool cancelled = false;
+    };
+
+    class ClickRemovalTask : public juce::ThreadWithProgressWindow
+    {
+    public:
+        ClickRemovalTask (juce::AudioBuffer<float>& target,
+                          double sr,
+                          int startSample,
+                          int endSample,
+                          float sensitivity,
+                          int maxWidth,
+                          ClickRemoval::RemovalMethod method)
+            : juce::ThreadWithProgressWindow ("Removing clicks...", true, false),
+              targetBuffer (target),
+              sampleRate (sr),
+              scanStart (startSample),
+              scanEnd (endSample),
+              clickSensitivity (sensitivity),
+              clickMaxWidth (maxWidth),
+              removalMethod (method)
+        {
+        }
+
+        void run() override
+        {
+            if (scanEnd <= scanStart)
+                return;
+
+            juce::dsp::ProcessSpec spec;
+            spec.sampleRate = sampleRate;
+            spec.numChannels = static_cast<juce::uint32> (targetBuffer.getNumChannels());
+            spec.maximumBlockSize = 2048;
+
+            ClickRemoval processor;
+            processor.prepare (spec);
+            processor.reset();
+            processor.setSensitivity (clickSensitivity);
+            processor.setMaxWidth (clickMaxWidth);
+            processor.setRemovalMethod (removalMethod);
+            processor.setStoreDetectedClicks (false);
+            processor.setApplyRemoval (true);
+            processor.resetSamplePosition();
+            processor.setSampleOffset (scanStart);
+
+            const int blockSize = 2048;
+            int totalClicksRemoved = 0;
+            int totalSamples = scanEnd - scanStart;
+
+            for (int start = scanStart; start < scanEnd; start += blockSize)
+            {
+                if (threadShouldExit())
+                {
+                    result.cancelled = true;
+                    return;
+                }
+
+                int samplesThisBlock = juce::jmin (blockSize, scanEnd - start);
+                juce::dsp::AudioBlock<float> block (targetBuffer.getArrayOfWritePointers(),
+                                                    static_cast<size_t> (targetBuffer.getNumChannels()),
+                                                    static_cast<size_t> (start),
+                                                    static_cast<size_t> (samplesThisBlock));
+
+                juce::dsp::ProcessContextReplacing<float> context (block);
+                processor.process (context);
+
+                totalClicksRemoved += processor.getClicksDetectedLastBlock();
+
+                setProgress (juce::jlimit (0.0, 1.0,
+                                           (start + samplesThisBlock - scanStart) / (double) totalSamples));
+            }
+
+            result.totalClicksRemoved = totalClicksRemoved;
+        }
+
+        void threadComplete (bool userPressedCancel) override
+        {
+            result.cancelled = result.cancelled || userPressedCancel;
+            if (onComplete)
+                onComplete (result);
+            delete this;
+        }
+
+        ClickRemovalResult result;
+        std::function<void (const ClickRemovalResult&)> onComplete;
+
+    private:
+        juce::AudioBuffer<float>& targetBuffer;
+        double sampleRate = 0.0;
+        int scanStart = 0;
+        int scanEnd = 0;
+        float clickSensitivity = 0.0f;
+        int clickMaxWidth = 0;
+        ClickRemoval::RemovalMethod removalMethod = ClickRemoval::Automatic;
+    };
+
+}
+
+namespace
+{
+    bool parseDiscogsUrl (const juce::String& discogsUrl, juce::String& apiPath, juce::String& errorMessage)
+    {
+        if (!discogsUrl.containsIgnoreCase ("discogs.com"))
+        {
+            errorMessage = "Not a Discogs URL.";
+            return false;
+        }
+
+        auto url = juce::URL (discogsUrl);
+        auto path = url.getSubPath();
+        auto tokens = juce::StringArray::fromTokens (path, "/", "");
+        tokens.removeEmptyStrings();
+
+        int typeIndex = -1;
+        juce::String type;
+        for (int i = 0; i < tokens.size(); ++i)
+        {
+            if (tokens[i] == "release" || tokens[i] == "releases")
+            {
+                typeIndex = i;
+                type = "releases";
+                break;
+            }
+            if (tokens[i] == "master" || tokens[i] == "masters")
+            {
+                typeIndex = i;
+                type = "masters";
+                break;
+            }
+        }
+
+        if (typeIndex < 0 || typeIndex + 1 >= tokens.size())
+        {
+            errorMessage = "Discogs URL must contain a release or master ID.";
+            return false;
+        }
+
+        juce::String idToken = tokens[typeIndex + 1];
+        idToken = idToken.upToFirstOccurrenceOf ("-", false, false);
+        if (idToken.isEmpty())
+        {
+            errorMessage = "Discogs URL is missing an ID.";
+            return false;
+        }
+
+        apiPath = "https://api.discogs.com/" + type + "/" + idToken;
+        return true;
+    }
+}
+
+class StandaloneWindow::AudioRecorder : public juce::AudioIODeviceCallback
+{
+public:
+    AudioRecorder()
+    {
+        backgroundThread.startThread();
+    }
+
+    ~AudioRecorder() override
+    {
+        stop();
+        backgroundThread.stopThread (1000);
+    }
+
+    bool startRecording (double sampleRate, int numChannels)
+    {
+        stop();
+
+        if (sampleRate <= 0.0 || numChannels <= 0)
+            return false;
+
+        recordedData.reset();
+
+        auto* memoryStream = new juce::MemoryOutputStream (recordedData, false);
+        juce::WavAudioFormat format;
+        auto* writer = format.createWriterFor (memoryStream,
+                                               sampleRate,
+                                               static_cast<unsigned int> (numChannels),
+                                               24,
+                                               {},
+                                               0);
+        if (writer == nullptr)
+        {
+            delete memoryStream;
+            return false;
+        }
+
+        threadedWriter.reset (new juce::AudioFormatWriter::ThreadedWriter (writer, backgroundThread, 32768));
+        activeWriter.store (threadedWriter.get());
+        recordingStartMs = juce::Time::getMillisecondCounterHiRes();
+        channelsToWrite = juce::jlimit (1, 2, numChannels);
+        return true;
+    }
+
+    void stop()
+    {
+        activeWriter.store (nullptr);
+        threadedWriter.reset();
+    }
+
+    bool isRecording() const
+    {
+        return activeWriter.load() != nullptr;
+    }
+
+    float getMeterLevel (int channel) const
+    {
+        return channel == 0 ? levelLeft.load() : levelRight.load();
+    }
+
+    double getSecondsRecorded() const
+    {
+        if (!isRecording())
+            return 0.0;
+
+        return (juce::Time::getMillisecondCounterHiRes() - recordingStartMs) / 1000.0;
+    }
+
+    juce::MemoryBlock takeRecordingData()
+    {
+        return std::move (recordedData);
+    }
+
+    void audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels,
+                                           float* const* outputChannelData, int numOutputChannels, int numSamples,
+                                           const juce::AudioIODeviceCallbackContext&) override
+    {
+        juce::ignoreUnused (outputChannelData, numOutputChannels);
+
+        auto* writer = activeWriter.load();
+        if (writer == nullptr || numSamples <= 0 || numInputChannels <= 0)
+            return;
+
+        const float* channelsToRecord[2] = { nullptr, nullptr };
+        channelsToRecord[0] = inputChannelData[0];
+
+        if (channelsToWrite > 1)
+        {
+            channelsToRecord[1] = (numInputChannels > 1) ? inputChannelData[1] : channelsToRecord[0];
+        }
+
+        if (channelsToRecord[0] == nullptr)
+            return;
+
+        writer->write (channelsToRecord, numSamples);
+
+        levelLeft.store (computeMeterLevel (channelsToRecord[0], numSamples));
+        const float* rightChannel = channelsToRecord[1] != nullptr ? channelsToRecord[1] : channelsToRecord[0];
+        levelRight.store (computeMeterLevel (rightChannel, numSamples));
+    }
+
+    void audioDeviceAboutToStart (juce::AudioIODevice*) override
+    {
+        levelLeft.store (0.0f);
+        levelRight.store (0.0f);
+    }
+
+    void audioDeviceStopped() override
+    {
+        levelLeft.store (0.0f);
+        levelRight.store (0.0f);
+    }
+
+private:
+    float computeMeterLevel (const float* samples, int numSamples) const
+    {
+        if (samples == nullptr || numSamples <= 0)
+            return 0.0f;
+
+        double sumSquares = 0.0;
+        for (int i = 0; i < numSamples; ++i)
+            sumSquares += samples[i] * samples[i];
+
+        double mean = sumSquares / numSamples;
+        float rms = static_cast<float> (std::sqrt (mean));
+        float db = juce::Decibels::gainToDecibels (rms, -60.0f);
+        return juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 60.0f);
+    }
+
+    juce::TimeSliceThread backgroundThread { "Audio Recorder Thread" };
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> threadedWriter;
+    std::atomic<juce::AudioFormatWriter::ThreadedWriter*> activeWriter { nullptr };
+    std::atomic<float> levelLeft { 0.0f };
+    std::atomic<float> levelRight { 0.0f };
+    juce::MemoryBlock recordedData;
+    double recordingStartMs = 0.0;
+    int channelsToWrite = 0;
+};
 
 //==============================================================================
 // StandaloneWindow Implementation
 //==============================================================================
+
+class StandaloneWindow::DenoiseAudioSource : public juce::AudioSource
+{
+public:
+    DenoiseAudioSource (juce::AudioSource& sourceToWrap,
+                        OnnxDenoiser& denoiserToUse,
+                        const bool& enabledFlag)
+        : source (sourceToWrap),
+          denoiser (denoiserToUse),
+          enabled (enabledFlag)
+    {
+    }
+
+    void prepareToPlay (int samplesPerBlockExpected, double sampleRate) override
+    {
+        source.prepareToPlay (samplesPerBlockExpected, sampleRate);
+        currentSampleRate = sampleRate;
+        currentBlockSize = samplesPerBlockExpected;
+        denoiser.prepare (sampleRate, currentNumChannels, samplesPerBlockExpected);
+    }
+
+    void releaseResources() override
+    {
+        source.releaseResources();
+        denoiser.reset();
+    }
+
+    void getNextAudioBlock (const juce::AudioSourceChannelInfo& info) override
+    {
+        source.getNextAudioBlock (info);
+
+        if (!enabled)
+            return;
+
+        auto* buffer = info.buffer;
+        if (buffer == nullptr)
+            return;
+
+        if (buffer->getNumChannels() != currentNumChannels)
+        {
+            currentNumChannels = buffer->getNumChannels();
+            if (currentSampleRate > 0.0)
+                denoiser.prepare (currentSampleRate, currentNumChannels, currentBlockSize);
+        }
+
+        if (info.startSample == 0 && info.numSamples == buffer->getNumSamples())
+        {
+            denoiser.setEnabled (true);
+            denoiser.processBlock (*buffer, 1.0f);
+            return;
+        }
+
+        tempBuffer.setSize (buffer->getNumChannels(), info.numSamples, false, false, true);
+        for (int ch = 0; ch < buffer->getNumChannels(); ++ch)
+            tempBuffer.copyFrom (ch, 0, *buffer, ch, info.startSample, info.numSamples);
+
+        denoiser.setEnabled (true);
+        denoiser.processBlock (tempBuffer, 1.0f);
+
+        for (int ch = 0; ch < buffer->getNumChannels(); ++ch)
+            buffer->copyFrom (ch, info.startSample, tempBuffer, ch, 0, info.numSamples);
+    }
+
+private:
+    juce::AudioSource& source;
+    OnnxDenoiser& denoiser;
+    const bool& enabled;
+    juce::AudioBuffer<float> tempBuffer;
+    double currentSampleRate = 0.0;
+    int currentBlockSize = 0;
+    int currentNumChannels = 2;
+};
 
 StandaloneWindow::StandaloneWindow()
     : DocumentWindow ("Vinyl Restoration Suite",
@@ -15,7 +597,7 @@ StandaloneWindow::StandaloneWindow()
 
     // Initialize audio device
     juce::String audioError = audioDeviceManager.initialise (
-        0,     // number of input channels
+        2,     // number of input channels
         2,     // number of output channels
         nullptr,  // saved state
         true   // select default device on failure
@@ -24,16 +606,24 @@ StandaloneWindow::StandaloneWindow()
     if (audioError.isNotEmpty())
     {
         DBG ("Audio device error: " + audioError);
+        audioError = audioDeviceManager.initialise (0, 2, nullptr, true);
+        if (audioError.isNotEmpty())
+            DBG ("Audio device error: " + audioError);
     }
 
     // Setup audio transport
     transportSource.addChangeListener (this);
-    audioSourcePlayer.setSource (&transportSource);
+    denoiseSource = std::make_unique<DenoiseAudioSource> (transportSource, realtimeDenoiser, aiDenoiseEnabled);
+    audioSourcePlayer.setSource (denoiseSource.get());
     audioDeviceManager.addAudioCallback (&audioSourcePlayer);
+    recorder = std::make_unique<AudioRecorder>();
+    audioDeviceManager.addAudioCallback (recorder.get());
+    applyDenoiserSettings();
 
     // Create main component
     mainComponent = std::make_unique<MainComponent>();
     mainComponent->setParentWindow (this);
+    mainComponent->setCorrectionListVisible (showCorrectionList);
 
     // Wire up waveform double-click to seek playback
     mainComponent->getWaveformDisplay().onSeekPosition = [this](double position)
@@ -95,43 +685,68 @@ StandaloneWindow::~StandaloneWindow()
     // Stop audio playback
     transportSource.setSource (nullptr);
     audioSourcePlayer.setSource (nullptr);
+    if (recorder)
+        recorder->stop();
     audioDeviceManager.removeAudioCallback (&audioSourcePlayer);
+    if (recorder)
+        audioDeviceManager.removeAudioCallback (recorder.get());
+    recorder.reset();
     transportSource.removeChangeListener (this);
+
+    if (activeBatchProcessor)
+    {
+        activeBatchProcessor->cancelProcessing();
+        activeBatchProcessor->stopThread (5000);
+        activeBatchProcessor.reset();
+    }
 
     setMenuBar (nullptr);
 }
 
 void StandaloneWindow::closeButtonPressed()
 {
-    if (hasUnsavedChanges)
-    {
-        int result = juce::AlertWindow::showYesNoCancelBox (
-            juce::AlertWindow::QuestionIcon,
-            "Unsaved Changes",
-            "Do you want to save your changes before closing?",
-            "Save", "Don't Save", "Cancel",
-            nullptr, nullptr
-        );
+    requestAppQuit();
+}
 
-        if (result == 0) // Cancel
-            return;
-        else if (result == 1) // Save
+void StandaloneWindow::requestAppQuit()
+{
+    if (!promptToSaveIfNeeded ("quitting"))
+        return;
+
+    juce::JUCEApplication::getInstance()->quit();
+}
+
+StandaloneWindow::ProcessingRange StandaloneWindow::getProcessingRange() const
+{
+    ProcessingRange range;
+    range.start = 0;
+    range.end = audioBuffer.getNumSamples();
+
+    if (mainComponent != nullptr)
+    {
+        int64_t selStart = -1;
+        int64_t selEnd = -1;
+        mainComponent->getWaveformDisplay().getSelection (selStart, selEnd);
+
+        if (selStart >= 0 && selEnd > selStart)
         {
-            if (currentFile.exists())
+            range.start = static_cast<int> (selStart);
+            range.end = static_cast<int> (juce::jmin (selEnd, (int64_t) audioBuffer.getNumSamples()));
+            range.hasSelection = true;
+
+            if (sampleRate > 0.0)
             {
-                saveFile (currentFile);
-            }
-            else
-            {
-                // No file exists, show save dialog
-                exportFile();
-                return; // exportFile is async, will handle quit after save
+                double startSec = range.start / sampleRate;
+                double endSec = range.end / sampleRate;
+                range.rangeInfo = juce::String (startSec, 2) + "s - " + juce::String (endSec, 2) + "s";
             }
         }
-        // result == 2 means "Don't Save" - fall through to quit
     }
 
-    juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    if (!range.hasSelection)
+        range.rangeInfo = "whole file";
+
+    return range;
 }
 
 //==============================================================================
@@ -180,6 +795,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
         menu.addItem (fileSaveAs, "Save As...             Ctrl+Shift+S");
         menu.addSeparator();
         menu.addItem (fileExport, "Export Audio...           Ctrl+E", audioBuffer.getNumSamples() > 0);
+        menu.addItem (fileRecord, isRecording ? "Stop Recording" : "Record Audio...           Ctrl+R");
         menu.addSeparator();
 
         // Recent files submenu
@@ -211,6 +827,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
         bool hasAudio = audioBuffer.getNumSamples() > 0;
         menu.addItem (processDetectClicks, "Detect Clicks", hasAudio);
         menu.addItem (processRemoveClicks, "Remove Clicks", hasAudio);
+        menu.addItem (processDecrackle, "Decrackle...", hasAudio);
         menu.addSeparator();
         menu.addItem (processNoiseReduction, "Noise Reduction...", hasAudio);
         menu.addSeparator();
@@ -253,12 +870,15 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
         menu.addSubMenu ("UI Scale", scaleMenu);
 
         menu.addSeparator();
-        menu.addItem (viewShowCorrectionList, "Show Correction List", true, true);
+        menu.addItem (viewShowCorrectionList, "Show Correction List", true, showCorrectionList);
         menu.addItem (viewShowSpectrogram, "Show Spectrogram...      Ctrl+G", audioBuffer.getNumSamples() > 0);
     }
     else if (topLevelMenuIndex == 4) // Options
     {
         menu.addItem (optionsAudioSettings, "Audio Settings...");
+        menu.addItem (optionsProcessingSettings, "AI/Processing Settings...");
+        menu.addSeparator();
+        menu.addItem (optionsAIDenoise, "AI Denoise (Realtime)", true, aiDenoiseEnabled);
     }
     else if (topLevelMenuIndex == 5) // Help
     {
@@ -356,13 +976,17 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
             exportFile();
             break;
 
+        case fileRecord:
+            toggleRecording();
+            break;
+
         case fileRecentClear:
             recentFiles.clear();
             menuItemsChanged();
             break;
 
         case fileExit:
-            juce::JUCEApplication::getInstance()->systemRequestedQuit();
+            requestAppQuit();
             break;
 
         // Edit menu
@@ -411,6 +1035,10 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
 
         case processRemoveClicks:
             removeClicks();
+            break;
+
+        case processDecrackle:
+            applyDecrackle();
             break;
 
         case processNoiseReduction:
@@ -464,6 +1092,13 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
         case optionsAudioSettings:
             showAudioSettings();
             break;
+        case optionsProcessingSettings:
+            showProcessingSettings();
+            break;
+        case optionsAIDenoise:
+            aiDenoiseEnabled = ! aiDenoiseEnabled;
+            realtimeDenoiser.setEnabled (aiDenoiseEnabled);
+            break;
 
         case helpAbout:
             showAboutDialog();
@@ -483,6 +1118,23 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
         case viewShowSpectrogram:
             showSpectrogram();
             break;
+        case viewShowCorrectionList:
+            showCorrectionList = !showCorrectionList;
+            if (mainComponent != nullptr)
+                mainComponent->setCorrectionListVisible (showCorrectionList);
+            break;
+        case viewZoomIn:
+            if (mainComponent != nullptr)
+                mainComponent->zoomIn();
+            break;
+        case viewZoomOut:
+            if (mainComponent != nullptr)
+                mainComponent->zoomOut();
+            break;
+        case viewZoomFit:
+            if (mainComponent != nullptr)
+                mainComponent->zoomFit();
+            break;
 
         default:
             break;
@@ -495,11 +1147,94 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
 
 void StandaloneWindow::timerCallback()
 {
+    if (isRecording && recorder != nullptr && recorder->isRecording())
+    {
+        meterLevelLeft = recorder->getMeterLevel (0);
+        meterLevelRight = recorder->getMeterLevel (1);
+        if (mainComponent != nullptr)
+        {
+            mainComponent->setMeterLevel (meterLevelLeft, meterLevelRight);
+            mainComponent->setTransportTime (recorder->getSecondsRecorded());
+        }
+        return;
+    }
+
     // Update playback position if playing
     if (transportSource.isPlaying())
     {
-        double position = transportSource.getCurrentPosition() / transportSource.getLengthInSeconds();
-        mainComponent->updatePlaybackPosition (position);
+        float newLeft = 0.0f;
+        float newRight = 0.0f;
+        if (audioBuffer.getNumSamples() > 0 && sampleRate > 0.0)
+        {
+            int centerSample = static_cast<int> (transportSource.getCurrentPosition() * sampleRate);
+            int windowSamples = static_cast<int> (sampleRate * 0.05);  // 50 ms
+            int startSample = juce::jmax (0, centerSample - windowSamples / 2);
+            int endSample = juce::jmin (audioBuffer.getNumSamples(), startSample + windowSamples);
+            int samplesToRead = juce::jmax (0, endSample - startSample);
+
+            if (samplesToRead > 0)
+            {
+                const int channels = audioBuffer.getNumChannels();
+                auto levelFromChannel = [&](int channel)
+                {
+                    double sumSquares = 0.0;
+                    const float* data = audioBuffer.getReadPointer (channel, startSample);
+                    for (int i = 0; i < samplesToRead; ++i)
+                        sumSquares += data[i] * data[i];
+
+                    double mean = sumSquares / samplesToRead;
+                    float rms = static_cast<float> (std::sqrt (mean));
+                    float db = juce::Decibels::gainToDecibels (rms, -60.0f);
+                    return juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 60.0f);
+                };
+
+                newLeft = levelFromChannel (0);
+                if (channels > 1)
+                    newRight = levelFromChannel (1);
+                else
+                    newRight = newLeft;
+            }
+        }
+
+        meterLevelLeft = newLeft;
+        meterLevelRight = newRight;
+        mainComponent->setMeterLevel (meterLevelLeft, meterLevelRight);
+
+        if (mainComponent != nullptr && mainComponent->isLoopSelectionEnabled() && sampleRate > 0.0)
+        {
+            int64_t selStart = -1, selEnd = -1;
+            mainComponent->getWaveformDisplay().getSelection (selStart, selEnd);
+
+            if (selStart >= 0 && selEnd > selStart)
+            {
+                double selStartSec = selStart / sampleRate;
+                double selEndSec = selEnd / sampleRate;
+                double currentPos = transportSource.getCurrentPosition();
+
+                if (currentPos >= selEndSec)
+                {
+                    transportSource.setPosition (selStartSec);
+                    double totalLength = transportSource.getLengthInSeconds();
+                    if (totalLength > 0.0)
+                        mainComponent->updatePlaybackPosition (selStartSec / totalLength);
+                }
+            }
+        }
+
+        double totalLength = transportSource.getLengthInSeconds();
+        if (totalLength > 0.0)
+        {
+            double position = transportSource.getCurrentPosition() / totalLength;
+            mainComponent->updatePlaybackPosition (position);
+            mainComponent->setTransportTime (transportSource.getCurrentPosition());
+        }
+    }
+    else
+    {
+        meterLevelLeft *= 0.85f;
+        meterLevelRight *= 0.85f;
+        if (mainComponent != nullptr)
+            mainComponent->setMeterLevel (meterLevelLeft, meterLevelRight);
     }
 }
 
@@ -519,6 +1254,9 @@ void StandaloneWindow::changeListenerCallback (juce::ChangeBroadcaster*)
 
 void StandaloneWindow::openFile (const juce::File& file)
 {
+    if (!promptToSaveIfNeeded ("opening a new file"))
+        return;
+
     if (!file.exists())
     {
         juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
@@ -615,6 +1353,7 @@ void StandaloneWindow::finishFileLoad (const juce::File& file)
     currentFile = file;
     currentSessionFile = juce::File();  // Clear session file when loading new audio
     recentFiles.addFile (file);
+    bufferedRecording.reset();
 
     // Save recent files immediately (in case app crashes later)
     auto settingsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
@@ -664,6 +1403,9 @@ void StandaloneWindow::finishFileLoad (const juce::File& file)
 
 void StandaloneWindow::closeFile()
 {
+    if (!promptToSaveIfNeeded ("closing the file"))
+        return;
+
     // Stop playback
     transportSource.stop();
     transportSource.setSource (nullptr);
@@ -674,6 +1416,7 @@ void StandaloneWindow::closeFile()
     audioBuffer.setSize (0, 0);
     currentFile = juce::File();
     currentSessionFile = juce::File();
+    bufferedRecording.reset();
 
     // Clear displays
     mainComponent->getWaveformDisplay().clear();
@@ -688,7 +1431,7 @@ void StandaloneWindow::closeFile()
     DBG ("Closed file");
 }
 
-void StandaloneWindow::saveFile (const juce::File& file)
+bool StandaloneWindow::saveFile (const juce::File& file)
 {
     // Ensure the file has .vrs extension
     juce::File sessionFile = file;
@@ -713,13 +1456,49 @@ void StandaloneWindow::saveFile (const juce::File& file)
         hasUnsavedChanges = false;
         updateTitle();
         DBG ("Saved session: " + sessionFile.getFullPathName());
+        return true;
     }
-    else
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                "Save Failed",
-                                                "Failed to save session file.");
-    }
+
+    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                            "Save Failed",
+                                            "Failed to save session file.");
+    return false;
+}
+
+bool StandaloneWindow::promptToSaveIfNeeded (const juce::String& actionName)
+{
+    if (!hasUnsavedChanges)
+        return true;
+
+    int result = juce::AlertWindow::showYesNoCancelBox (
+        juce::AlertWindow::QuestionIcon,
+        "Unsaved Changes",
+        "Do you want to save your changes before " + actionName + "?",
+        "Save", "Don't Save", "Cancel",
+        nullptr, nullptr
+    );
+
+    if (result == 0) // Cancel
+        return false;
+
+    if (result == 1) // Save
+        return saveCurrentSessionForPrompt();
+
+    return true; // Don't Save
+}
+
+bool StandaloneWindow::saveCurrentSessionForPrompt()
+{
+    if (currentSessionFile.exists())
+        return saveFile (currentSessionFile);
+
+    if (currentFile.exists())
+        return saveFile (currentFile);
+
+    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                            "Nothing to Save",
+                                            "No audio file is loaded to save a session.");
+    return false;
 }
 
 void StandaloneWindow::exportFile()
@@ -740,13 +1519,23 @@ void StandaloneWindow::exportFile()
                     juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
                                                             "Export Complete",
                                                             "Audio exported successfully.");
+                    if (quitAfterExport)
+                    {
+                        quitAfterExport = false;
+                        juce::JUCEApplication::getInstance()->quit();
+                    }
                 }
                 else
                 {
                     juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
                                                             "Export Failed",
                                                             "Failed to export audio file.");
+                    quitAfterExport = false;
                 }
+            }
+            else
+            {
+                quitAfterExport = false;
             }
         });
 }
@@ -761,30 +1550,127 @@ void StandaloneWindow::detectClicks()
         return;
     }
 
+    class ClickDetectionSettingsComponent : public juce::Component
+    {
+    public:
+        ClickDetectionSettingsComponent (float sensitivity,
+                                         int maxWidth,
+                                         int method,
+                                         double sampleRate)
+        {
+            sensitivitySlider.setRange (0.0, 100.0, 1.0);
+            sensitivitySlider.setValue (sensitivity);
+            sensitivitySlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            sensitivitySlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+            sensitivitySlider.setTextValueSuffix (" %");
+            setSliderColours (sensitivitySlider);
+            addAndMakeVisible (sensitivitySlider);
+
+            maxWidthSlider.setRange (10.0, 2000.0, 1.0);
+            maxWidthSlider.setValue (maxWidth);
+            maxWidthSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            maxWidthSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+            maxWidthSlider.setTextValueSuffix (" smp");
+            setSliderColours (maxWidthSlider);
+            addAndMakeVisible (maxWidthSlider);
+
+            methodBox.addItem ("Spline Interpolation", 1);
+            methodBox.addItem ("Crossfade Smoothing", 2);
+            methodBox.addItem ("Automatic", 3);
+            methodBox.setSelectedId (method + 1);
+            addAndMakeVisible (methodBox);
+
+            sensitivityLabel.setText ("Sensitivity", juce::dontSendNotification);
+            sensitivityLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (sensitivityLabel);
+
+            maxWidthLabel.setText ("Max Click Width", juce::dontSendNotification);
+            maxWidthLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (maxWidthLabel);
+
+            methodLabel.setText ("Removal Method", juce::dontSendNotification);
+            methodLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (methodLabel);
+
+            if (sampleRate > 0.0)
+            {
+                double widthMs = (maxWidth / sampleRate) * 1000.0;
+                widthHint.setText ("Approx. width at current sample rate: " +
+                                       juce::String (widthMs, 2) + " ms",
+                                   juce::dontSendNotification);
+            }
+            widthHint.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (widthHint);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (10, 10);
+            auto row = area.removeFromTop (28);
+            sensitivityLabel.setBounds (row.removeFromLeft (140));
+            sensitivitySlider.setBounds (row);
+
+            area.removeFromTop (8);
+            row = area.removeFromTop (28);
+            maxWidthLabel.setBounds (row.removeFromLeft (140));
+            maxWidthSlider.setBounds (row);
+
+            area.removeFromTop (8);
+            row = area.removeFromTop (24);
+            methodLabel.setBounds (row.removeFromLeft (140));
+            methodBox.setBounds (row.removeFromLeft (200));
+
+            area.removeFromTop (8);
+            widthHint.setBounds (area.removeFromTop (20));
+        }
+
+        float getSensitivity() const { return (float) sensitivitySlider.getValue(); }
+        int getMaxWidth() const { return (int) maxWidthSlider.getValue(); }
+        int getMethodIndex() const { return methodBox.getSelectedId() - 1; }
+
+    private:
+        static void setSliderColours (juce::Slider& slider)
+        {
+            slider.setColour (juce::Slider::trackColourId, juce::Colour (0xff4a90e2));
+            slider.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff1a1a1a));
+            slider.setColour (juce::Slider::thumbColourId, juce::Colour (0xff8bd0ff));
+        }
+
+        juce::Slider sensitivitySlider;
+        juce::Slider maxWidthSlider;
+        juce::ComboBox methodBox;
+        juce::Label sensitivityLabel;
+        juce::Label maxWidthLabel;
+        juce::Label methodLabel;
+        juce::Label widthHint;
+    };
+
     // Create click detection settings dialog
     auto* dialog = new juce::AlertWindow ("Click Detection Settings",
                                           "Configure click detection parameters:",
                                           juce::AlertWindow::QuestionIcon);
 
-    dialog->addTextEditor ("sensitivity", juce::String (clickSensitivity, 0), "Sensitivity (0-100):");
-    dialog->addTextEditor ("maxWidth", juce::String (clickMaxWidth), "Max Click Width (samples):");
-    dialog->addComboBox ("method", {"Spline Interpolation", "Crossfade Smoothing", "Automatic"}, "Removal Method:");
-    dialog->getComboBoxComponent ("method")->setSelectedId (clickRemovalMethod + 1);
+    auto* settingsComponent = new ClickDetectionSettingsComponent (clickSensitivity,
+                                                                    clickMaxWidth,
+                                                                    clickRemovalMethod,
+                                                                    sampleRate);
+    settingsComponent->setSize (420, 150);
+    dialog->addCustomComponent (settingsComponent);
 
     dialog->addButton ("Detect", 1, juce::KeyPress (juce::KeyPress::returnKey));
     dialog->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
 
     dialog->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, dialog] (int result)
+        [this, dialog, settingsComponent] (int result)
         {
             if (result == 1)
             {
                 // Get settings from dialog
-                clickSensitivity = dialog->getTextEditorContents ("sensitivity").getFloatValue();
+                clickSensitivity = settingsComponent->getSensitivity();
                 clickSensitivity = juce::jlimit (0.0f, 100.0f, clickSensitivity);
-                clickMaxWidth = dialog->getTextEditorContents ("maxWidth").getIntValue();
+                clickMaxWidth = settingsComponent->getMaxWidth();
                 clickMaxWidth = juce::jlimit (10, 2000, clickMaxWidth);
-                clickRemovalMethod = dialog->getComboBoxComponent ("method")->getSelectedId() - 1;
+                clickRemovalMethod = settingsComponent->getMethodIndex();
 
                 // Now perform the actual detection
                 performClickDetection();
@@ -817,103 +1703,62 @@ void StandaloneWindow::performClickDetection()
     DBG ("Starting click detection on " + juce::String (scanEnd - scanStart) + " samples (" + rangeInfo + ")");
     DBG ("Settings: sensitivity=" + juce::String (clickSensitivity) + ", maxWidth=" + juce::String (clickMaxWidth) + ", method=" + juce::String (clickRemovalMethod));
 
-    // Configure click detection
-    juce::dsp::ProcessSpec spec;
-    spec.sampleRate = sampleRate;
-    spec.numChannels = static_cast<juce::uint32> (audioBuffer.getNumChannels());
-    spec.maximumBlockSize = 2048;
+    auto* task = new ClickDetectionTask (audioBuffer,
+                                         sampleRate,
+                                         scanStart,
+                                         scanEnd,
+                                         clickSensitivity,
+                                         clickMaxWidth,
+                                         static_cast<ClickRemoval::RemovalMethod> (clickRemovalMethod));
 
-    clickRemovalProcessor.prepare (spec);
-    clickRemovalProcessor.reset();  // Clear previous detections
-    clickRemovalProcessor.setSensitivity (clickSensitivity);
-    clickRemovalProcessor.setMaxWidth (clickMaxWidth);
-    clickRemovalProcessor.setRemovalMethod (static_cast<ClickRemoval::RemovalMethod> (clickRemovalMethod));
-    clickRemovalProcessor.setStoreDetectedClicks (true);  // IMPORTANT: Store clicks for GUI display
-    clickRemovalProcessor.setApplyRemoval (false);  // Detection only - don't modify audio
-    clickRemovalProcessor.resetSamplePosition();   // Reset position counter
-    clickRemovalProcessor.setSampleOffset (scanStart);  // Set offset for correct position reporting
-
-    // Create a copy of the buffer for detection (non-destructive scan)
-    juce::AudioBuffer<float> scanBuffer;
-    scanBuffer.makeCopyOf (audioBuffer);
-
-    // Process in blocks to detect clicks
-    const int blockSize = 2048;
-    int totalClicks = 0;
-    int totalSamples = scanEnd - scanStart;
-    int lastProgressPercent = 0;
-
-    for (int startSample = scanStart; startSample < scanEnd; startSample += blockSize)
+    task->onComplete = [this, rangeInfo] (const ClickDetectionResult& result)
     {
-        int samplesThisBlock = juce::jmin (blockSize, scanEnd - startSample);
-
-        juce::dsp::AudioBlock<float> block (scanBuffer.getArrayOfWritePointers(),
-                                            static_cast<size_t> (scanBuffer.getNumChannels()),
-                                            static_cast<size_t> (startSample),
-                                            static_cast<size_t> (samplesThisBlock));
-
-        juce::dsp::ProcessContextReplacing<float> context (block);
-        clickRemovalProcessor.process (context);
-
-        totalClicks += clickRemovalProcessor.getClicksDetectedLastBlock();
-
-        // Update progress every 5%
-        int currentPercent = (int) (100.0 * (startSample - scanStart) / (double) totalSamples);
-        if (currentPercent >= lastProgressPercent + 5)
+        if (result.cancelled)
         {
-            lastProgressPercent = currentPercent;
-            mainComponent->getCorrectionListView().setStatusText (
-                "Detecting clicks... " + juce::String (currentPercent) + "% (" +
-                juce::String (totalClicks) + " found)");
-            repaint();
+            mainComponent->getCorrectionListView().setStatusText ("Click detection cancelled");
+            return;
         }
-    }
 
-    DBG ("Total clicks detected during scan: " + juce::String (totalClicks));
+        DBG ("Total clicks detected during scan: " + juce::String (result.totalClicks));
+        DBG ("Clicks stored in vector: " + juce::String (result.clicks.size()));
 
-    // Get detected clicks and add to correction list
-    const auto& detectedClicks = clickRemovalProcessor.getDetectedClicks();
+        if (result.clicks.empty())
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
+                                                    "Click Detection Complete",
+                                                    "No clicks or pops detected in the audio.\n\n"
+                                                    "The audio appears to be clean, or try adjusting sensitivity.");
+        }
+        else
+        {
+            auto* applier = new ClickDetectionApplier (
+                &mainComponent->getCorrectionListView(),
+                &mainComponent->getWaveformDisplay(),
+                result.clicks,
+                rangeInfo,
+                [this] (const juce::String& status)
+                {
+                    mainComponent->getCorrectionListView().setStatusText (status);
+                },
+                [this, rangeInfo] (size_t count)
+                {
+                    if (count > 0)
+                        hasUnsavedChanges = true;
 
-    DBG ("Clicks stored in vector: " + juce::String (detectedClicks.size()));
+                    updateTitle();
 
-    mainComponent->getCorrectionListView().clearCorrections();
-    mainComponent->getWaveformDisplay().clearClickMarkers();
+                    juce::String message = "Detected " + juce::String (count) + " clicks/pops in " + rangeInfo + ".";
+                    mainComponent->getCorrectionListView().setStatusText (message);
 
-    for (const auto& click : detectedClicks)
-    {
-        mainComponent->getCorrectionListView().addCorrection (
-            click.position,
-            click.magnitude,
-            click.width,
-            click.isManual ? "Manual" : "Auto",
-            false
-        );
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
+                                                            "Click Detection Complete",
+                                                            message + "\n\nUse 'Process > Remove Clicks' to apply corrections.");
+                });
+            (void) applier;
+        }
+    };
 
-        // Add marker to waveform display
-        mainComponent->getWaveformDisplay().addClickMarker (click.position);
-    }
-
-    if (!detectedClicks.empty())
-        hasUnsavedChanges = true;
-
-    updateTitle();
-
-    juce::String message = "Detected " + juce::String (detectedClicks.size()) + " clicks/pops.";
-    mainComponent->getCorrectionListView().setStatusText (message);
-
-    if (detectedClicks.empty())
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                "Click Detection Complete",
-                                                "No clicks or pops detected in the audio.\n\n"
-                                                "The audio appears to be clean, or try adjusting sensitivity.");
-    }
-    else
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                "Click Detection Complete",
-                                                message + "\n\nUse 'Process > Remove Clicks' to apply corrections.");
-    }
+    task->launchThread();
 }
 
 void StandaloneWindow::removeClicks()
@@ -926,69 +1771,148 @@ void StandaloneWindow::removeClicks()
         return;
     }
 
+    // Check if there's a selection - if so, only remove in selection
+    auto& waveform = mainComponent->getWaveformDisplay();
+    int64_t selStart = -1, selEnd = -1;
+    waveform.getSelection (selStart, selEnd);
+
+    int scanStart = 0;
+    int scanEnd = audioBuffer.getNumSamples();
+    juce::String rangeInfo = "whole file";
+
+    if (selStart >= 0 && selEnd > selStart)
+    {
+        scanStart = static_cast<int> (selStart);
+        scanEnd = static_cast<int> (juce::jmin (selEnd, (int64_t) audioBuffer.getNumSamples()));
+        double startSec = scanStart / sampleRate;
+        double endSec = scanEnd / sampleRate;
+        rangeInfo = juce::String (startSec, 2) + "s - " + juce::String (endSec, 2) + "s";
+    }
+
+    if (scanEnd <= scanStart)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Invalid Selection",
+                                                "Selection range is empty.");
+        return;
+    }
+
     // Save state for undo
     undoManager.saveState (audioBuffer, sampleRate, "Click Removal");
 
-    mainComponent->getCorrectionListView().setStatusText ("Removing clicks...");
-    DBG ("Starting click removal on " + juce::String (audioBuffer.getNumSamples()) + " samples");
+    mainComponent->getCorrectionListView().setStatusText ("Removing clicks in " + rangeInfo + "...");
+    DBG ("Starting click removal on " + juce::String (scanEnd - scanStart) + " samples (" + rangeInfo + ")");
 
-    // Configure click removal processor
-    juce::dsp::ProcessSpec spec;
-    spec.sampleRate = sampleRate;
-    spec.numChannels = static_cast<juce::uint32> (audioBuffer.getNumChannels());
-    spec.maximumBlockSize = 2048;
+    auto* task = new ClickRemovalTask (audioBuffer,
+                                       sampleRate,
+                                       scanStart,
+                                       scanEnd,
+                                       clickSensitivity,
+                                       clickMaxWidth,
+                                       static_cast<ClickRemoval::RemovalMethod> (clickRemovalMethod));
 
-    clickRemovalProcessor.prepare (spec);
-    clickRemovalProcessor.reset();
-    clickRemovalProcessor.setSensitivity (clickSensitivity);
-    clickRemovalProcessor.setMaxWidth (clickMaxWidth);
-    clickRemovalProcessor.setRemovalMethod (static_cast<ClickRemoval::RemovalMethod> (clickRemovalMethod));
-    clickRemovalProcessor.setStoreDetectedClicks (false);  // Don't need to store, just remove
-    clickRemovalProcessor.setApplyRemoval (true);  // Actually remove the clicks
-    clickRemovalProcessor.resetSamplePosition();
-
-    // Process the actual audio buffer (destructive operation)
-    const int blockSize = 2048;
-    int totalClicksRemoved = 0;
-
-    for (int startSample = 0; startSample < audioBuffer.getNumSamples(); startSample += blockSize)
+    task->onComplete = [this, rangeInfo] (const ClickRemovalResult& result)
     {
-        int samplesThisBlock = juce::jmin (blockSize, audioBuffer.getNumSamples() - startSample);
+        DBG ("Total clicks removed: " + juce::String (result.totalClicksRemoved));
 
-        juce::dsp::AudioBlock<float> block (audioBuffer.getArrayOfWritePointers(),
-                                            static_cast<size_t> (audioBuffer.getNumChannels()),
-                                            static_cast<size_t> (startSample),
-                                            static_cast<size_t> (samplesThisBlock));
+        // Mark corrections as applied in the list
+        mainComponent->getCorrectionListView().markAllApplied();
 
-        juce::dsp::ProcessContextReplacing<float> context (block);
-        clickRemovalProcessor.process (context);
+        // Clear the click markers from waveform display (red lines)
+        mainComponent->getWaveformDisplay().clearClickMarkers();
 
-        totalClicksRemoved += clickRemovalProcessor.getClicksDetectedLastBlock();
+        // Clear the correction list as well since clicks are now removed
+        mainComponent->getCorrectionListView().clearCorrections();
+
+        // Update waveform display to show processed audio
+        mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
+
+        hasUnsavedChanges = true;
+        updateTitle();
+
+        juce::String message = "Removed " + juce::String (result.totalClicksRemoved) + " clicks/pops in " + rangeInfo + ".";
+        mainComponent->getCorrectionListView().setStatusText (message);
+
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
+                                                "Click Removal Complete",
+                                                message);
+    };
+
+    task->launchThread();
+}
+
+void StandaloneWindow::applyDecrackle()
+{
+    if (audioBuffer.getNumSamples() == 0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "No Audio",
+                                                "Please load an audio file first.");
+        return;
     }
 
-    DBG ("Total clicks removed: " + juce::String (totalClicksRemoved));
+    auto* dialog = new juce::AlertWindow ("Decrackle",
+                                          "Reduce fine crackle noise:",
+                                          juce::AlertWindow::QuestionIcon);
 
-    // Mark corrections as applied in the list
-    mainComponent->getCorrectionListView().markAllApplied();
+    dialog->addTextEditor ("factor", "0.5", "Sensitivity (0.01-1.0):");
+    dialog->addTextEditor ("width", "3", "Smoothing Width (1-10 samples):");
 
-    // Clear the click markers from waveform display (red lines)
-    mainComponent->getWaveformDisplay().clearClickMarkers();
+    dialog->addButton ("Apply", 1);
+    dialog->addButton ("Cancel", 0);
 
-    // Clear the correction list as well since clicks are now removed
-    mainComponent->getCorrectionListView().clearCorrections();
+    dialog->enterModalState (true, juce::ModalCallbackFunction::create (
+        [this, dialog] (int result)
+        {
+            if (result != 1)
+            {
+                delete dialog;
+                return;
+            }
 
-    // Update waveform display to show processed audio
-    mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
+            float factor = dialog->getTextEditorContents ("factor").getFloatValue();
+            int width = dialog->getTextEditorContents ("width").getIntValue();
 
-    hasUnsavedChanges = true;
-    updateTitle();
+            factor = juce::jlimit (0.01f, 1.0f, factor);
+            width = juce::jlimit (1, 10, width);
 
-    juce::String message = "Removed " + juce::String (totalClicksRemoved) + " clicks/pops.";
-    mainComponent->getCorrectionListView().setStatusText (message);
+            undoManager.saveState (audioBuffer, sampleRate, "Decrackle");
+            auto range = getProcessingRange();
+            mainComponent->getCorrectionListView().setStatusText ("Applying decrackle in " + range.rangeInfo + "...");
 
-    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                            "Click Removal Complete",
-                                            message);
+            decrackleProcessor.setFactor (factor);
+            decrackleProcessor.setAverageWidth (width);
+            if (range.hasSelection)
+            {
+                const int selectionSamples = range.end - range.start;
+                juce::AudioBuffer<float> temp (audioBuffer.getNumChannels(), selectionSamples);
+                for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+                    temp.copyFrom (ch, 0, audioBuffer, ch, range.start, selectionSamples);
+
+                decrackleProcessor.process (temp);
+
+                for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+                    audioBuffer.copyFrom (ch, range.start, temp, ch, 0, selectionSamples);
+            }
+            else
+            {
+                decrackleProcessor.process (audioBuffer);
+            }
+
+            mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
+            hasUnsavedChanges = true;
+            updateTitle();
+
+            juce::String message = "Decrackle applied (factor " + juce::String (factor, 2) +
+                                   ", width " + juce::String (width) + ").";
+            mainComponent->getCorrectionListView().setStatusText (message);
+
+            juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
+                                                    "Decrackle Complete",
+                                                    message);
+            delete dialog;
+        }
+    ), true);
 }
 
 void StandaloneWindow::applyNoiseReduction()
@@ -1001,35 +1925,145 @@ void StandaloneWindow::applyNoiseReduction()
         return;
     }
 
+    class NoiseReductionSettingsComponent : public juce::Component
+    {
+    public:
+        NoiseReductionSettingsComponent (float reductionDb,
+                                         float profileStart,
+                                         float profileLength,
+                                         int adaptiveIndex,
+                                         double maxSeconds)
+        {
+            reductionSlider.setRange (0.0, 24.0, 0.5);
+            reductionSlider.setValue (reductionDb);
+            reductionSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            reductionSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+            reductionSlider.setTextValueSuffix (" dB");
+            setSliderColours (reductionSlider);
+            addAndMakeVisible (reductionSlider);
+
+            profileStartSlider.setRange (0.0, juce::jmax (0.1, maxSeconds), 0.01);
+            profileStartSlider.setValue (profileStart);
+            profileStartSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            profileStartSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+            profileStartSlider.setTextValueSuffix (" s");
+            setSliderColours (profileStartSlider);
+            addAndMakeVisible (profileStartSlider);
+
+            profileLengthSlider.setRange (0.1, juce::jmax (0.2, juce::jmin (10.0, maxSeconds)), 0.01);
+            profileLengthSlider.setValue (profileLength);
+            profileLengthSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            profileLengthSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+            profileLengthSlider.setTextValueSuffix (" s");
+            setSliderColours (profileLengthSlider);
+            addAndMakeVisible (profileLengthSlider);
+
+            adaptiveBox.addItem ("Off", 1);
+            adaptiveBox.addItem ("Slow", 2);
+            adaptiveBox.addItem ("Medium", 3);
+            adaptiveBox.addItem ("Fast", 4);
+            adaptiveBox.setSelectedId (adaptiveIndex + 1);
+            addAndMakeVisible (adaptiveBox);
+
+            reductionLabel.setText ("Reduction Amount", juce::dontSendNotification);
+            reductionLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (reductionLabel);
+
+            profileStartLabel.setText ("Profile Start", juce::dontSendNotification);
+            profileStartLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (profileStartLabel);
+
+            profileLengthLabel.setText ("Profile Length", juce::dontSendNotification);
+            profileLengthLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (profileLengthLabel);
+
+            adaptiveLabel.setText ("Adaptive Profile", juce::dontSendNotification);
+            adaptiveLabel.setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (adaptiveLabel);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (10, 10);
+            auto row = area.removeFromTop (28);
+            reductionLabel.setBounds (row.removeFromLeft (140));
+            reductionSlider.setBounds (row);
+
+            area.removeFromTop (8);
+            row = area.removeFromTop (28);
+            profileStartLabel.setBounds (row.removeFromLeft (140));
+            profileStartSlider.setBounds (row);
+
+            area.removeFromTop (8);
+            row = area.removeFromTop (28);
+            profileLengthLabel.setBounds (row.removeFromLeft (140));
+            profileLengthSlider.setBounds (row);
+
+            area.removeFromTop (8);
+            row = area.removeFromTop (24);
+            adaptiveLabel.setBounds (row.removeFromLeft (140));
+            adaptiveBox.setBounds (row.removeFromLeft (200));
+        }
+
+        float getReductionDb() const { return (float) reductionSlider.getValue(); }
+        float getProfileStart() const { return (float) profileStartSlider.getValue(); }
+        float getProfileLength() const { return (float) profileLengthSlider.getValue(); }
+        int getAdaptiveIndex() const { return adaptiveBox.getSelectedId() - 1; }
+
+    private:
+        static void setSliderColours (juce::Slider& slider)
+        {
+            slider.setColour (juce::Slider::trackColourId, juce::Colour (0xff4a90e2));
+            slider.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff1a1a1a));
+            slider.setColour (juce::Slider::thumbColourId, juce::Colour (0xff8bd0ff));
+        }
+
+        juce::Slider reductionSlider;
+        juce::Slider profileStartSlider;
+        juce::Slider profileLengthSlider;
+        juce::ComboBox adaptiveBox;
+        juce::Label reductionLabel;
+        juce::Label profileStartLabel;
+        juce::Label profileLengthLabel;
+        juce::Label adaptiveLabel;
+    };
+
     // Create noise reduction settings dialog
     auto* dialog = new juce::AlertWindow ("Noise Reduction Settings",
                                           "Configure noise reduction parameters:",
                                           juce::AlertWindow::QuestionIcon);
 
-    dialog->addTextEditor ("reduction", "12", "Reduction Amount (dB):");
-    dialog->addTextEditor ("profileStart", "0", "Profile Start (seconds):");
-    dialog->addTextEditor ("profileLength", "1", "Profile Length (seconds):");
+    auto range = getProcessingRange();
+    const double maxSeconds = (range.end - range.start) / juce::jmax (1.0, sampleRate);
+    const float defaultProfileLength = (float) juce::jmax (0.1, juce::jmin (1.0, maxSeconds));
+    auto* settingsComponent = new NoiseReductionSettingsComponent (12.0f, 0.0f, defaultProfileLength, 0, maxSeconds);
+    settingsComponent->setSize (440, 160);
+    dialog->addCustomComponent (settingsComponent);
 
     dialog->addButton ("Apply", 1);
     dialog->addButton ("Cancel", 0);
 
     dialog->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, dialog] (int result)
+        [this, dialog, settingsComponent, range] (int result)
         {
             if (result == 1)
             {
-                float reductionDB = dialog->getTextEditorContents ("reduction").getFloatValue();
-                float profileStart = dialog->getTextEditorContents ("profileStart").getFloatValue();
-                float profileLength = dialog->getTextEditorContents ("profileLength").getFloatValue();
+                float reductionDB = settingsComponent->getReductionDb();
+                float profileStart = settingsComponent->getProfileStart();
+                float profileLength = settingsComponent->getProfileLength();
+                int adaptiveIdx = settingsComponent->getAdaptiveIndex();
 
                 reductionDB = juce::jlimit (0.0f, 24.0f, reductionDB);
                 profileStart = juce::jmax (0.0f, profileStart);
                 profileLength = juce::jmax (0.1f, profileLength);
+                float adaptiveRates[] = {0.0f, 0.01f, 0.03f, 0.06f};
+                float adaptiveRate = adaptiveRates[juce::jlimit (0, 3, adaptiveIdx)];
 
                 // Apply noise reduction on message thread (for GUI responsiveness)
-                juce::MessageManager::callAsync ([this, reductionDB, profileStart, profileLength]()
+                juce::MessageManager::callAsync ([this, reductionDB, profileStart, profileLength, adaptiveRate, range]()
                 {
-                    applyNoiseReductionWithSettings (reductionDB, profileStart, profileLength);
+                    applyNoiseReductionWithSettings (reductionDB, profileStart, profileLength, adaptiveRate,
+                                                     range.start, range.end);
                 });
             }
             delete dialog;
@@ -1037,8 +2071,21 @@ void StandaloneWindow::applyNoiseReduction()
     ), true);
 }
 
-void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB, float profileStartSec, float profileLengthSec)
+void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB,
+                                                        float profileStartSec,
+                                                        float profileLengthSec,
+                                                        float adaptiveRate,
+                                                        int processStartSample,
+                                                        int processEndSample)
 {
+    if (processEndSample <= processStartSample)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Invalid Selection",
+                                                "Selection range is empty.");
+        return;
+    }
+
     // Save state for undo
     undoManager.saveState (audioBuffer, sampleRate, "Noise Reduction");
 
@@ -1052,12 +2099,23 @@ void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB, float
 
     noiseReductionProcessor.prepare (spec);
     noiseReductionProcessor.setReduction (reductionDB);
+    noiseReductionProcessor.setAdaptiveEnabled (adaptiveRate > 0.0f);
+    noiseReductionProcessor.setAdaptiveRate (adaptiveRate);
 
-    // Calculate profile sample range
-    int profileStartSample = static_cast<int> (profileStartSec * sampleRate);
+    // Calculate profile sample range within the processing range
+    int profileStartSample = processStartSample + static_cast<int> (profileStartSec * sampleRate);
     int profileLengthSamples = static_cast<int> (profileLengthSec * sampleRate);
-    profileStartSample = juce::jlimit (0, audioBuffer.getNumSamples() - 1, profileStartSample);
-    profileLengthSamples = juce::jmin (profileLengthSamples, audioBuffer.getNumSamples() - profileStartSample);
+    profileStartSample = juce::jlimit (processStartSample, processEndSample - 1, profileStartSample);
+    profileLengthSamples = juce::jmin (profileLengthSamples, processEndSample - profileStartSample);
+
+    if (profileLengthSamples <= 0)
+    {
+        mainComponent->getCorrectionListView().setStatusText ("Failed to capture noise profile");
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Noise Reduction Failed",
+                                                "Profile length is too short for the selected range.");
+        return;
+    }
 
     // Capture noise profile from specified section
     noiseReductionProcessor.captureProfile();
@@ -1094,9 +2152,9 @@ void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB, float
     // Now process the entire audio buffer
     mainComponent->getCorrectionListView().setStatusText ("Processing audio...");
 
-    for (int startSample = 0; startSample < audioBuffer.getNumSamples(); startSample += blockSize)
+    for (int startSample = processStartSample; startSample < processEndSample; startSample += blockSize)
     {
-        int samplesThisBlock = juce::jmin (blockSize, audioBuffer.getNumSamples() - startSample);
+        int samplesThisBlock = juce::jmin (blockSize, processEndSample - startSample);
 
         juce::dsp::AudioBlock<float> block (audioBuffer.getArrayOfWritePointers(),
                                             static_cast<size_t> (audioBuffer.getNumChannels()),
@@ -1113,7 +2171,8 @@ void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB, float
     hasUnsavedChanges = true;
     updateTitle();
 
-    juce::String message = "Applied " + juce::String (reductionDB, 1) + " dB noise reduction.";
+    juce::String adaptiveLabel = adaptiveRate > 0.0f ? " (adaptive)" : "";
+    juce::String message = "Applied " + juce::String (reductionDB, 1) + " dB noise reduction" + adaptiveLabel + ".";
     mainComponent->getCorrectionListView().setStatusText (message);
 
     juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
@@ -1131,15 +2190,37 @@ void StandaloneWindow::detectTracks()
         return;
     }
 
-    TrackDetector detector;
     TrackDetector::DetectionSettings settings;
     settings.silenceThresholdDb = -40.0f;
     settings.minSilenceDurationSeconds = 2.0;
     settings.minTrackDurationSeconds = 10.0;
 
-    auto boundaries = detector.detectTracks (audioBuffer, sampleRate, settings);
+    auto range = getProcessingRange();
+    const juce::AudioBuffer<float>* bufferToAnalyze = &audioBuffer;
+    juce::AudioBuffer<float> selectionBuffer;
+    int64_t offset = 0;
 
-    juce::String message = "Detected " + juce::String (boundaries.size()) + " track boundaries.";
+    if (range.hasSelection)
+    {
+        const int selectionSamples = range.end - range.start;
+        selectionBuffer.setSize (audioBuffer.getNumChannels(), selectionSamples);
+        for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+            selectionBuffer.copyFrom (ch, 0, audioBuffer, ch, range.start, selectionSamples);
+        bufferToAnalyze = &selectionBuffer;
+        offset = range.start;
+    }
+
+    auto boundaries = trackDetector.detectTracks (*bufferToAnalyze, sampleRate, settings);
+
+    if (offset > 0 && !boundaries.empty())
+    {
+        for (auto& boundary : boundaries)
+            boundary.position += offset;
+        trackDetector.setBoundaries (boundaries);
+    }
+
+    juce::String message = "Detected " + juce::String (boundaries.size()) + " track boundaries in " +
+                           (range.hasSelection ? range.rangeInfo : "whole file") + ".";
     juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
                                             "Track Detection",
                                             message);
@@ -1147,10 +2228,231 @@ void StandaloneWindow::detectTracks()
 
 void StandaloneWindow::splitTracks()
 {
-    // TODO: Implement track splitting with dialog
-    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                            "Split Tracks",
-                                            "Track splitting will be implemented here.");
+    if (audioBuffer.getNumSamples() == 0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "No Audio",
+                                                "Please load an audio file first.");
+        return;
+    }
+
+    auto* dialog = new juce::AlertWindow ("Split Tracks",
+                                          "Split and export detected tracks:",
+                                          juce::AlertWindow::QuestionIcon);
+
+    dialog->addTextEditor ("baseName",
+                           currentFile.exists() ? currentFile.getFileNameWithoutExtension() : "VinylRip",
+                           "Base filename:");
+    dialog->addComboBox ("format", {"wav", "flac"}, "Format:");
+    dialog->getComboBoxComponent ("format")->setSelectedItemIndex (0);
+    dialog->addTextEditor ("discogsUrl", "", "Discogs URL (optional):");
+    dialog->addTextEditor ("discogsToken", "", "Discogs token (optional):");
+
+    dialog->addButton ("Export", 1);
+    dialog->addButton ("Cancel", 0);
+
+    dialog->enterModalState (true, juce::ModalCallbackFunction::create (
+        [this, dialog] (int result)
+        {
+            if (result != 1)
+            {
+                delete dialog;
+                return;
+            }
+
+            juce::String baseName = dialog->getTextEditorContents ("baseName").trim();
+            if (baseName.isEmpty())
+                baseName = "VinylRip";
+
+            auto formatIdx = dialog->getComboBoxComponent ("format")->getSelectedItemIndex();
+            juce::String extension = (formatIdx == 1) ? "flac" : "wav";
+
+            juce::String discogsUrl = dialog->getTextEditorContents ("discogsUrl").trim();
+            juce::String discogsToken = dialog->getTextEditorContents ("discogsToken").trim();
+
+            auto chooser = std::make_shared<juce::FileChooser> (
+                "Select Output Folder",
+                currentFile.getParentDirectory(),
+                "*");
+
+            chooser->launchAsync (juce::FileBrowserComponent::openMode |
+                                 juce::FileBrowserComponent::canSelectDirectories,
+                [this, chooser, baseName, extension, discogsUrl, discogsToken] (const juce::FileChooser&)
+                {
+                    auto results = chooser->getResults();
+                    if (results.size() == 0)
+                        return;
+
+                    auto outputDir = results[0];
+                    TrackDetector::DetectionSettings settings;
+                    settings.silenceThresholdDb = -40.0f;
+                    settings.minSilenceDurationSeconds = 2.0;
+                    settings.minTrackDurationSeconds = 10.0;
+
+                    auto range = getProcessingRange();
+                    const juce::AudioBuffer<float>* bufferToExport = &audioBuffer;
+                    juce::AudioBuffer<float> selectionBuffer;
+
+                    if (range.hasSelection)
+                    {
+                        const int selectionSamples = range.end - range.start;
+                        selectionBuffer.setSize (audioBuffer.getNumChannels(), selectionSamples);
+                        for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+                            selectionBuffer.copyFrom (ch, 0, audioBuffer, ch, range.start, selectionSamples);
+                        bufferToExport = &selectionBuffer;
+                    }
+
+                    if (trackDetector.getBoundaries().empty() || range.hasSelection)
+                        trackDetector.detectTracks (*bufferToExport, sampleRate, settings);
+
+                    auto boundaryCount = (int) trackDetector.getBoundaries().size();
+                    auto expectedTracks = boundaryCount + 1;
+
+                    if (discogsUrl.isNotEmpty())
+                    {
+                        juce::String albumTitle;
+                        juce::String artistName;
+                        juce::String year;
+                        juce::StringArray trackNames;
+                        juce::String errorMessage;
+
+                        if (fetchDiscogsMetadata (discogsUrl, discogsToken,
+                                                  albumTitle, artistName, year,
+                                                  trackNames, errorMessage))
+                        {
+                            if (trackNames.size() == expectedTracks)
+                            {
+                                trackDetector.setTrackNames (trackNames);
+                            }
+                            else
+                            {
+                                juce::AlertWindow::showMessageBoxAsync (
+                                    juce::AlertWindow::WarningIcon,
+                                    "Discogs Track Count Mismatch",
+                                    "Discogs returned " + juce::String (trackNames.size()) +
+                                    " tracks, but " + juce::String (expectedTracks) +
+                                    " were detected. Exporting with default names.");
+                            }
+                        }
+                        else
+                        {
+                            juce::AlertWindow::showMessageBoxAsync (
+                                juce::AlertWindow::WarningIcon,
+                                "Discogs Lookup Failed",
+                                errorMessage);
+                        }
+                    }
+
+                    mainComponent->getCorrectionListView().setStatusText ("Exporting tracks...");
+                    bool ok = trackDetector.exportTracks (*bufferToExport, sampleRate, outputDir, baseName, extension);
+                    mainComponent->getCorrectionListView().setStatusText (ok ? "Track export complete" : "Track export failed");
+
+                    juce::AlertWindow::showMessageBoxAsync (
+                        ok ? juce::AlertWindow::InfoIcon : juce::AlertWindow::WarningIcon,
+                        ok ? "Tracks Exported" : "Export Failed",
+                        ok ? "Tracks exported successfully." : "Failed to export tracks.");
+                });
+            delete dialog;
+        }
+    ), true);
+}
+
+bool StandaloneWindow::fetchDiscogsMetadata (const juce::String& discogsUrl,
+                                             const juce::String& token,
+                                             juce::String& albumTitle,
+                                             juce::String& artistName,
+                                             juce::String& year,
+                                             juce::StringArray& trackNames,
+                                             juce::String& errorMessage)
+{
+    juce::String apiPath;
+    if (!parseDiscogsUrl (discogsUrl, apiPath, errorMessage))
+        return false;
+
+    juce::String headers = "User-Agent: AudioRestorationVST/1.0\r\nAccept: application/json";
+    if (token.isNotEmpty())
+        headers += "\r\nAuthorization: Discogs token=" + token;
+
+    int statusCode = 0;
+    juce::URL apiUrl (apiPath);
+    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                       .withExtraHeaders (headers)
+                       .withConnectionTimeoutMs (10000)
+                       .withStatusCode (&statusCode);
+    auto stream = apiUrl.createInputStream (options);
+
+    if (stream == nullptr)
+    {
+        errorMessage = "Discogs request failed to start.";
+        return false;
+    }
+
+    if (statusCode != 200)
+    {
+        errorMessage = "Discogs request failed (HTTP " + juce::String (statusCode) + ").";
+        return false;
+    }
+
+    auto jsonText = stream->readEntireStreamAsString();
+    auto parsed = juce::JSON::parse (jsonText);
+    if (parsed.isVoid() || !parsed.isObject())
+    {
+        errorMessage = "Discogs returned invalid JSON.";
+        return false;
+    }
+
+    auto obj = parsed.getDynamicObject();
+    albumTitle = obj->getProperty ("title").toString();
+    year = obj->getProperty ("year").toString();
+
+    if (obj->hasProperty ("artists"))
+    {
+        auto artistsVar = obj->getProperty ("artists");
+        if (auto* arr = artistsVar.getArray())
+        {
+            juce::StringArray artists;
+            for (auto& entry : *arr)
+            {
+                if (auto* artistObj = entry.getDynamicObject())
+                {
+                    auto name = artistObj->getProperty ("name").toString();
+                    if (name.isNotEmpty())
+                        artists.add (name);
+                }
+            }
+            artistName = artists.joinIntoString (", ");
+        }
+    }
+
+    trackNames.clear();
+    if (obj->hasProperty ("tracklist"))
+    {
+        auto tracklistVar = obj->getProperty ("tracklist");
+        if (auto* arr = tracklistVar.getArray())
+        {
+            for (auto& entry : *arr)
+            {
+                if (auto* trackObj = entry.getDynamicObject())
+                {
+                    auto type = trackObj->getProperty ("type_").toString();
+                    if (type == "track")
+                    {
+                        auto title = trackObj->getProperty ("title").toString();
+                        if (title.isNotEmpty())
+                            trackNames.add (title);
+                    }
+                }
+            }
+        }
+    }
+
+    if (trackNames.isEmpty())
+    {
+        errorMessage = "Discogs returned no tracklist.";
+        return false;
+    }
+
+    return true;
 }
 
 void StandaloneWindow::showBatchProcessor()
@@ -1225,13 +2527,32 @@ void StandaloneWindow::showBatchProcessor()
                 chooser->launchAsync (juce::FileBrowserComponent::openMode |
                                      juce::FileBrowserComponent::canSelectFiles |
                                      juce::FileBrowserComponent::canSelectMultipleItems,
-                    [this, settings, chooser] (const juce::FileChooser&)
+                    [this, settings, chooser] (const juce::FileChooser&) mutable
                     {
                         auto results = chooser->getResults();
-                        if (results.size() > 0)
-                        {
-                            startBatchProcessing (results, settings);
-                        }
+                        if (results.size() == 0)
+                            return;
+
+                        auto defaultDir = lastBatchOutputDirectory.exists()
+                                            ? lastBatchOutputDirectory
+                                            : results[0].getParentDirectory();
+                        auto outputChooser = std::make_shared<juce::FileChooser> (
+                            "Select Output Folder (optional)",
+                            defaultDir,
+                            "*");
+
+                        outputChooser->launchAsync (juce::FileBrowserComponent::openMode |
+                                                    juce::FileBrowserComponent::canSelectDirectories,
+                            [this, settings, results, outputChooser] (const juce::FileChooser&) mutable
+                            {
+                                auto outputResults = outputChooser->getResults();
+                                if (outputResults.size() > 0)
+                                {
+                                    settings.outputDirectory = outputResults[0];
+                                    lastBatchOutputDirectory = settings.outputDirectory;
+                                }
+                                startBatchProcessing (results, settings);
+                            });
                     });
             }
             delete dialog;
@@ -1241,17 +2562,25 @@ void StandaloneWindow::showBatchProcessor()
 
 void StandaloneWindow::startBatchProcessing (const juce::Array<juce::File>& files, const BatchProcessor::Settings& settings)
 {
+    if (activeBatchProcessor && activeBatchProcessor->isProcessing())
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Batch Processing Busy",
+                                                "A batch job is already running.");
+        return;
+    }
+
     // Create batch processor
-    auto batchProcessor = std::make_unique<BatchProcessor>();
+    activeBatchProcessor = std::make_unique<BatchProcessor>();
 
     // Add files to queue
     for (const auto& file : files)
     {
-        batchProcessor->addFile (file);
+        activeBatchProcessor->addFile (file);
     }
 
     // Set progress callback
-    batchProcessor->setProgressCallback ([this] (const BatchProcessor::ProgressInfo& info)
+    activeBatchProcessor->setProgressCallback ([this] (const BatchProcessor::ProgressInfo& info)
     {
         mainComponent->getCorrectionListView().setStatusText (
             "Batch: " + juce::String (info.currentFileIndex) + "/" +
@@ -1259,23 +2588,19 @@ void StandaloneWindow::startBatchProcessing (const juce::Array<juce::File>& file
     });
 
     // Set completion callback
-    batchProcessor->setCompletionCallback ([this] (bool success, const juce::String& message)
+    activeBatchProcessor->setCompletionCallback ([this] (bool success, const juce::String& message)
     {
         mainComponent->getCorrectionListView().setStatusText ("Ready");
         juce::AlertWindow::showMessageBoxAsync (
             success ? juce::AlertWindow::InfoIcon : juce::AlertWindow::WarningIcon,
             "Batch Processing Complete",
             message);
+        activeBatchProcessor.reset();
     });
 
     // Start processing
     mainComponent->getCorrectionListView().setStatusText ("Starting batch processing...");
-    batchProcessor->startProcessing (settings);
-
-    // Note: batchProcessor will be destroyed here, but the thread will continue
-    // This is a limitation - in production, we'd want to keep the processor alive
-    // For now, we'll just start it and let it run
-    batchProcessor.release();  // Release ownership to prevent deletion
+    activeBatchProcessor->startProcessing (settings);
 }
 
 void StandaloneWindow::showAboutDialog()
@@ -1342,8 +2667,16 @@ void StandaloneWindow::showAboutDialog()
 
             // Crackling decreases over time (first 5 seconds)
             float crackleAmount = juce::jmax (0.0f, 1.0f - (animationTime / 5.0f));
-            float musicVolume = 0.15f;
-            float crackleVolume = 0.12f * crackleAmount;
+
+            // Fade out the demo once restoration completes
+            const float fadeOutStart = 5.0f;
+            const float fadeOutDuration = 4.0f;
+            float fadeOut = 1.0f;
+            if (animationTime > fadeOutStart)
+                fadeOut = juce::jlimit (0.0f, 1.0f, 1.0f - ((animationTime - fadeOutStart) / fadeOutDuration));
+
+            float musicVolume = 0.15f * fadeOut;
+            float crackleVolume = 0.12f * crackleAmount * fadeOut;
 
             for (int i = 0; i < bufferToFill.numSamples; ++i)
             {
@@ -1575,7 +2908,7 @@ void StandaloneWindow::showAboutDialog()
 
             // Version at bottom of label - smaller
             g.setFont (juce::Font (juce::FontOptions (16.0f)));
-            g.drawText ("Version 1.5.2",
+            g.drawText ("Version 1.6.1",
                        centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.62f,
                        labelRadius * 1.8f, 24.0f,
                        juce::Justification::centred);
@@ -1671,7 +3004,7 @@ void StandaloneWindow::showAboutDialog()
 
         // Animation state
         float animationTime = 0.0f;
-        float vinylRotation = 0.0f;
+        float vinylRotation = -180.0f;
     };
 
     // Create and show the overlay with audio demo
@@ -1727,6 +3060,9 @@ void StandaloneWindow::updateTitle()
 
 void StandaloneWindow::loadSession (const juce::File& sessionFile)
 {
+    if (!promptToSaveIfNeeded ("opening a session"))
+        return;
+
     juce::File audioFile;
     juce::var sessionData;
 
@@ -1750,6 +3086,7 @@ void StandaloneWindow::loadSession (const juce::File& sessionFile)
     currentFile = audioFile;
     currentSessionFile = sessionFile;  // Track the session file
     recentFiles.addFile (sessionFile);
+    bufferedRecording.reset();
 
     // Save recent files immediately
     auto settingsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
@@ -1942,38 +3279,279 @@ void StandaloneWindow::showGraphicEQ()
         return;
     }
 
-    // Create 10-band graphic EQ dialog
-    auto* dialog = new juce::AlertWindow ("Graphic Equaliser",
-                                          "Adjust frequency bands (dB gain, -12 to +12):",
-                                          juce::AlertWindow::QuestionIcon);
-
-    // Standard 10-band frequencies
-    const char* bands[] = {"31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz",
-                           "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"};
-
-    for (int i = 0; i < 10; ++i)
+    class GraphicEQComponent : public juce::Component,
+                               private juce::Timer
     {
-        dialog->addTextEditor (juce::String (i), "0", bands[i]);
-    }
+    public:
+        GraphicEQComponent (const std::array<float, 10>& current,
+                            const juce::AudioBuffer<float>& buffer,
+                            double sampleRate)
+            : currentGains (current),
+              previewSampleRate (sampleRate)
+        {
+            const char* bands[] = {"31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz",
+                                   "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"};
+            const float freqs[] = {31.0f, 62.0f, 125.0f, 250.0f, 500.0f,
+                                   1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f};
 
-    dialog->addButton ("Apply", 1);
-    dialog->addButton ("Reset", 2);
-    dialog->addButton ("Cancel", 0);
+            previewBuffer = makePreviewBuffer (buffer, previewSampleRate);
+
+            for (int i = 0; i < 10; ++i)
+            {
+                auto& slider = sliders[i];
+                slider.setRange (-12.0, 12.0, 0.1);
+                slider.setValue (0.0);
+                slider.setSliderStyle (juce::Slider::LinearVertical);
+                slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 50, 18);
+                slider.setTextBoxIsEditable (false);
+                slider.setTextValueSuffix (" dB");
+                setSliderColours (slider);
+                slider.onValueChange = [this]
+                {
+                    updateTargetGains();
+                    pendingPreviewUpdate = true;
+                };
+                addAndMakeVisible (slider);
+
+                labels[i].setText (bands[i], juce::dontSendNotification);
+                labels[i].setJustificationType (juce::Justification::centred);
+                addAndMakeVisible (labels[i]);
+            }
+
+            currentLabel.setText ("Current", juce::dontSendNotification);
+            currentLabel.setJustificationType (juce::Justification::centred);
+            addAndMakeVisible (currentLabel);
+            targetLabel.setText ("With EQ", juce::dontSendNotification);
+            targetLabel.setJustificationType (juce::Justification::centred);
+            addAndMakeVisible (targetLabel);
+
+            currentPreview.setShowAxes (false);
+            targetPreview.setShowAxes (false);
+            addAndMakeVisible (currentPreview);
+            addAndMakeVisible (targetPreview);
+            updateTargetGains();
+            updateSpectrograms();
+            startTimerHz (15);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (10, 10);
+
+            auto leftPreviewArea = area.removeFromLeft (240);
+            auto rightPreviewArea = area.removeFromRight (240);
+
+            currentLabel.setBounds (leftPreviewArea.removeFromTop (18));
+            currentPreview.setBounds (leftPreviewArea.reduced (4, 4));
+
+            targetLabel.setBounds (rightPreviewArea.removeFromTop (18));
+            targetPreview.setBounds (rightPreviewArea.reduced (4, 4));
+
+            int columnWidth = area.getWidth() / 10;
+            for (int i = 0; i < 10; ++i)
+            {
+                auto column = area.removeFromLeft (columnWidth);
+                labels[i].setBounds (column.removeFromTop (20));
+                sliders[i].setBounds (column.reduced (4, 0));
+            }
+        }
+
+        std::array<float, 10> getGains() const
+        {
+            std::array<float, 10> gains {};
+            for (int i = 0; i < 10; ++i)
+                gains[i] = (float) sliders[i].getValue();
+            return gains;
+        }
+
+    private:
+        void timerCallback() override
+        {
+            if (pendingPreviewUpdate)
+            {
+                pendingPreviewUpdate = false;
+                updateSpectrograms();
+            }
+        }
+
+        void updateTargetGains()
+        {
+            for (int i = 0; i < 10; ++i)
+                targetGains[i] = (float) sliders[i].getValue();
+        }
+
+        void updateSpectrograms()
+        {
+            if (previewBuffer.getNumSamples() == 0 || previewSampleRate <= 0.0)
+                return;
+
+            if (!currentSpectrogramReady)
+            {
+                currentPreview.setPalette (SpectrogramDisplay::Palette::Spectrum);
+                currentPreview.setDbRange (-90.0f, 0.0f);
+                currentPreview.analyzeBuffer (previewBuffer, previewSampleRate);
+                currentSpectrogramReady = true;
+            }
+
+            auto eqBuffer = previewBuffer;
+            juce::dsp::ProcessSpec spec;
+            spec.sampleRate = previewSampleRate;
+            spec.numChannels = static_cast<juce::uint32> (eqBuffer.getNumChannels());
+            spec.maximumBlockSize = 2048;
+
+            FilterBank eqProcessor;
+            eqProcessor.prepare (spec);
+            for (int i = 0; i < 10; ++i)
+                eqProcessor.setEQBand (i, targetGains[i]);
+
+            const int blockSize = 2048;
+            for (int startSample = 0; startSample < eqBuffer.getNumSamples(); startSample += blockSize)
+            {
+                int samplesThisBlock = juce::jmin (blockSize, eqBuffer.getNumSamples() - startSample);
+                juce::dsp::AudioBlock<float> block (eqBuffer.getArrayOfWritePointers(),
+                                                    static_cast<size_t> (eqBuffer.getNumChannels()),
+                                                    static_cast<size_t> (startSample),
+                                                    static_cast<size_t> (samplesThisBlock));
+                juce::dsp::ProcessContextReplacing<float> context (block);
+                eqProcessor.process (context);
+            }
+
+            targetPreview.setPalette (SpectrogramDisplay::Palette::Spectrum);
+            targetPreview.setDbRange (-90.0f, 0.0f);
+            targetPreview.analyzeBuffer (eqBuffer, previewSampleRate);
+        }
+
+        static juce::AudioBuffer<float> makePreviewBuffer (const juce::AudioBuffer<float>& buffer, double sampleRate)
+        {
+            if (buffer.getNumSamples() == 0 || sampleRate <= 0.0)
+                return {};
+
+            int maxSamples = static_cast<int> (sampleRate * 8.0); // 8 seconds preview
+            int samplesToCopy = juce::jmin (buffer.getNumSamples(), maxSamples);
+            juce::AudioBuffer<float> preview (buffer.getNumChannels(), samplesToCopy);
+            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+                preview.copyFrom (ch, 0, buffer, ch, 0, samplesToCopy);
+            return preview;
+        }
+
+        static void setSliderColours (juce::Slider& slider)
+        {
+            slider.setColour (juce::Slider::trackColourId, juce::Colour (0xff4a90e2));
+            slider.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff1a1a1a));
+            slider.setColour (juce::Slider::thumbColourId, juce::Colour (0xff8bd0ff));
+        }
+
+        std::array<juce::Slider, 10> sliders;
+        std::array<juce::Label, 10> labels;
+        std::array<float, 10> currentGains {};
+        std::array<float, 10> targetGains {};
+        SpectrogramDisplay currentPreview;
+        SpectrogramDisplay targetPreview;
+        juce::Label currentLabel;
+        juce::Label targetLabel;
+        juce::AudioBuffer<float> previewBuffer;
+        double previewSampleRate = 0.0;
+        bool currentSpectrogramReady = false;
+        bool pendingPreviewUpdate = false;
+    };
+
+    class GraphicEQDialogComponent : public juce::Component,
+                                     public juce::Button::Listener
+    {
+    public:
+        GraphicEQDialogComponent (const std::array<float, 10>& current,
+                                  const juce::AudioBuffer<float>& buffer,
+                                  double sampleRate)
+        {
+            eqComponent = std::make_unique<GraphicEQComponent> (current, buffer, sampleRate);
+            addAndMakeVisible (*eqComponent);
+
+            applyButton.setButtonText ("Apply");
+            resetButton.setButtonText ("Reset");
+            cancelButton.setButtonText ("Cancel");
+            addAndMakeVisible (applyButton);
+            addAndMakeVisible (resetButton);
+            addAndMakeVisible (cancelButton);
+
+            applyButton.addListener (this);
+            resetButton.addListener (this);
+            cancelButton.addListener (this);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (10);
+            auto buttonArea = area.removeFromBottom (40);
+            eqComponent->setBounds (area);
+
+            const int buttonWidth = 90;
+            const int gap = 10;
+            auto rightArea = buttonArea.removeFromRight (buttonWidth * 3 + gap * 2);
+            applyButton.setBounds (rightArea.removeFromLeft (buttonWidth));
+            rightArea.removeFromLeft (gap);
+            resetButton.setBounds (rightArea.removeFromLeft (buttonWidth));
+            rightArea.removeFromLeft (gap);
+            cancelButton.setBounds (rightArea.removeFromLeft (buttonWidth));
+        }
+
+        void buttonClicked (juce::Button* button) override
+        {
+            if (onAction == nullptr)
+                return;
+
+            if (button == &applyButton)
+                onAction (1);
+            else if (button == &resetButton)
+                onAction (2);
+            else if (button == &cancelButton)
+                onAction (0);
+        }
+
+        std::array<float, 10> getGains() const
+        {
+            return eqComponent->getGains();
+        }
+
+        std::function<void(int)> onAction;
+
+    private:
+        std::unique_ptr<GraphicEQComponent> eqComponent;
+        juce::TextButton applyButton;
+        juce::TextButton resetButton;
+        juce::TextButton cancelButton;
+    };
+
+    auto* dialog = new juce::DialogWindow ("Graphic Equaliser",
+                                           juce::Colour (0xff2a3338),
+                                           true);
+    auto* content = new GraphicEQDialogComponent (lastEqGains, audioBuffer, sampleRate);
+    content->setSize (900, 460);
+    dialog->setContentOwned (content, true);
+    dialog->setResizable (true, true);
+    dialog->setResizeLimits (700, 380, 1200, 720);
+    dialog->centreWithSize (900, 460);
+
+    content->onAction = [dialog] (int result)
+    {
+        dialog->exitModalState (result);
+        dialog->setVisible (false);
+    };
 
     dialog->enterModalState (true, juce::ModalCallbackFunction::create (
         [this, dialog] (int result)
         {
-            if (result == 1)
+            auto* content = dynamic_cast<GraphicEQDialogComponent*> (dialog->getContentComponent());
+            if (result == 1 && content != nullptr)
             {
-                // Get gain values
-                float gains[10];
+                auto gains = content->getGains();
                 bool hasChanges = false;
-                for (int i = 0; i < 10; ++i)
+                for (float gain : gains)
                 {
-                    gains[i] = juce::jlimit (-12.0f, 12.0f,
-                                            dialog->getTextEditorContents (juce::String (i)).getFloatValue());
-                    if (std::abs (gains[i]) > 0.1f)
+                    if (std::abs (gain) > 0.1f)
+                    {
                         hasChanges = true;
+                        break;
+                    }
                 }
 
                 if (!hasChanges)
@@ -1988,7 +3566,17 @@ void StandaloneWindow::showGraphicEQ()
                 // Save state for undo
                 undoManager.saveState (audioBuffer, sampleRate, "Graphic EQ");
 
-                mainComponent->getCorrectionListView().setStatusText ("Applying EQ...");
+                auto range = getProcessingRange();
+                if (range.end <= range.start)
+                {
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                            "Invalid Selection",
+                                                            "Selection range is empty.");
+                    delete dialog;
+                    return;
+                }
+
+                mainComponent->getCorrectionListView().setStatusText ("Applying EQ in " + range.rangeInfo + "...");
 
                 // Configure filter bank
                 juce::dsp::ProcessSpec spec;
@@ -2001,14 +3589,14 @@ void StandaloneWindow::showGraphicEQ()
                 // Set EQ gains (FilterBank has 10 bands at 31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz)
                 for (int i = 0; i < 10; ++i)
                 {
-                    filterBankProcessor.setEQBand (i, gains[i]);
+                    filterBankProcessor.setEQBand (i, gains[static_cast<size_t> (i)]);
                 }
 
                 // Process audio
                 const int blockSize = 2048;
-                for (int startSample = 0; startSample < audioBuffer.getNumSamples(); startSample += blockSize)
+                for (int startSample = range.start; startSample < range.end; startSample += blockSize)
                 {
-                    int samplesThisBlock = juce::jmin (blockSize, audioBuffer.getNumSamples() - startSample);
+                    int samplesThisBlock = juce::jmin (blockSize, range.end - startSample);
 
                     juce::dsp::AudioBlock<float> block (audioBuffer.getArrayOfWritePointers(),
                                                         static_cast<size_t> (audioBuffer.getNumChannels()),
@@ -2022,6 +3610,7 @@ void StandaloneWindow::showGraphicEQ()
                 // Update display
                 mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
 
+                lastEqGains = gains;
                 hasUnsavedChanges = true;
                 updateTitle();
 
@@ -2032,11 +3621,11 @@ void StandaloneWindow::showGraphicEQ()
             }
             else if (result == 2)
             {
-                // Reset - reopen dialog
                 delete dialog;
                 showGraphicEQ();
                 return;
             }
+
             delete dialog;
         }
     ), true);
@@ -2052,6 +3641,15 @@ void StandaloneWindow::normalise()
         return;
     }
 
+    auto range = getProcessingRange();
+    if (range.end <= range.start)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Invalid Selection",
+                                                "Selection range is empty.");
+        return;
+    }
+
     // Create normalise dialog
     auto* dialog = new juce::AlertWindow ("Normalise",
                                           "Adjust audio level to target peak:",
@@ -2061,9 +3659,9 @@ void StandaloneWindow::normalise()
     float currentPeak = 0.0f;
     for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
     {
-        auto range = juce::FloatVectorOperations::findMinAndMax (
-            audioBuffer.getReadPointer (ch), audioBuffer.getNumSamples());
-        currentPeak = juce::jmax (currentPeak, std::abs (range.getStart()), std::abs (range.getEnd()));
+        auto minMax = juce::FloatVectorOperations::findMinAndMax (
+            audioBuffer.getReadPointer (ch) + range.start, range.end - range.start);
+        currentPeak = juce::jmax (currentPeak, std::abs (minMax.getStart()), std::abs (minMax.getEnd()));
     }
     float currentPeakDb = juce::Decibels::gainToDecibels (currentPeak);
 
@@ -2075,7 +3673,7 @@ void StandaloneWindow::normalise()
     dialog->addButton ("Cancel", 0);
 
     dialog->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, dialog, currentPeak] (int result)
+        [this, dialog, currentPeak, range] (int result)
         {
             if (result == 1)
             {
@@ -2102,13 +3700,14 @@ void StandaloneWindow::normalise()
                 {
                     // Calculate RMS
                     float sumSquares = 0.0f;
+                    int selectionSamples = range.end - range.start;
                     for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
                     {
-                        const float* data = audioBuffer.getReadPointer (ch);
-                        for (int i = 0; i < audioBuffer.getNumSamples(); ++i)
+                        const float* data = audioBuffer.getReadPointer (ch) + range.start;
+                        for (int i = 0; i < selectionSamples; ++i)
                             sumSquares += data[i] * data[i];
                     }
-                    float rms = std::sqrt (sumSquares / (audioBuffer.getNumSamples() * audioBuffer.getNumChannels()));
+                    float rms = std::sqrt (sumSquares / (selectionSamples * audioBuffer.getNumChannels()));
 
                     if (rms > 0.0001f)
                         gainFactor = targetGain / rms;
@@ -2124,7 +3723,7 @@ void StandaloneWindow::normalise()
                 for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
                 {
                     juce::FloatVectorOperations::multiply (
-                        audioBuffer.getWritePointer (ch), gainFactor, audioBuffer.getNumSamples());
+                        audioBuffer.getWritePointer (ch) + range.start, gainFactor, range.end - range.start);
                 }
 
                 // Update display
@@ -2164,18 +3763,28 @@ void StandaloneWindow::channelBalance()
         return;
     }
 
+    auto range = getProcessingRange();
+    if (range.end <= range.start)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "Invalid Selection",
+                                                "Selection range is empty.");
+        return;
+    }
+
     // Calculate current balance
     float leftRms = 0.0f, rightRms = 0.0f;
-    const float* leftData = audioBuffer.getReadPointer (0);
-    const float* rightData = audioBuffer.getReadPointer (1);
+    const float* leftData = audioBuffer.getReadPointer (0) + range.start;
+    const float* rightData = audioBuffer.getReadPointer (1) + range.start;
 
-    for (int i = 0; i < audioBuffer.getNumSamples(); ++i)
+    const int selectionSamples = range.end - range.start;
+    for (int i = 0; i < selectionSamples; ++i)
     {
         leftRms += leftData[i] * leftData[i];
         rightRms += rightData[i] * rightData[i];
     }
-    leftRms = std::sqrt (leftRms / audioBuffer.getNumSamples());
-    rightRms = std::sqrt (rightRms / audioBuffer.getNumSamples());
+    leftRms = std::sqrt (leftRms / selectionSamples);
+    rightRms = std::sqrt (rightRms / selectionSamples);
 
     float currentBalance = 0.0f;
     if (leftRms + rightRms > 0.0001f)
@@ -2199,7 +3808,7 @@ void StandaloneWindow::channelBalance()
     dialog->addButton ("Cancel", 0);
 
     dialog->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, dialog, leftRms, rightRms] (int result)
+        [this, dialog, leftRms, rightRms, range] (int result)
         {
             if (result == 1 || result == 2)
             {
@@ -2227,9 +3836,9 @@ void StandaloneWindow::channelBalance()
 
                 // Apply gains
                 juce::FloatVectorOperations::multiply (
-                    audioBuffer.getWritePointer (0), leftGain, audioBuffer.getNumSamples());
+                    audioBuffer.getWritePointer (0) + range.start, leftGain, range.end - range.start);
                 juce::FloatVectorOperations::multiply (
-                    audioBuffer.getWritePointer (1), rightGain, audioBuffer.getNumSamples());
+                    audioBuffer.getWritePointer (1) + range.start, rightGain, range.end - range.start);
 
                 // Update display
                 mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
@@ -2289,6 +3898,16 @@ void StandaloneWindow::wowFlutterRemoval()
         {
             if (result == 1)
             {
+                auto range = getProcessingRange();
+                if (range.end <= range.start)
+                {
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                            "Invalid Selection",
+                                                            "Selection range is empty.");
+                    delete dialog;
+                    return;
+                }
+
                 int sourceType = dialog->getComboBoxComponent ("source")->getSelectedItemIndex();
                 int rpmIndex = dialog->getComboBoxComponent ("rpm")->getSelectedItemIndex();
                 float eccentricity = dialog->getTextEditorContents ("eccentricity").getFloatValue();
@@ -2318,11 +3937,25 @@ void StandaloneWindow::wowFlutterRemoval()
                     return;
                 }
 
+                if (!applyCorrection)
+                {
+                    juce::String message = "Preview only:\n\n"
+                                           "RPM: " + juce::String (rpm, 1) + "\n"
+                                           "Wow frequency: " + juce::String (wowFrequency, 3) + " Hz\n"
+                                           "Eccentricity: " + juce::String (eccentricity, 1) + " mm\n"
+                                           "Estimated pitch deviation: +/- " + juce::String (pitchDeviation, 2) + "%";
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
+                                                            "Wow & Flutter Preview",
+                                                            message);
+                    delete dialog;
+                    return;
+                }
+
                 // Save state for undo
                 undoManager.saveState (audioBuffer, sampleRate, "Eccentric Record Correction");
 
                 mainComponent->getCorrectionListView().setStatusText (
-                    "Correcting wow at " + juce::String (wowFrequency, 3) + " Hz, " +
+                    "Correcting wow in " + range.rangeInfo + " at " + juce::String (wowFrequency, 3) + " Hz, " +
                     juce::String (pitchDeviation, 2) + "% deviation...");
 
                 DBG ("Eccentric correction: RPM=" + juce::String (rpm) +
@@ -2335,7 +3968,7 @@ void StandaloneWindow::wowFlutterRemoval()
                 // Uses variable-rate resampling to correct sinusoidal pitch error
                 //==============================================================
 
-                const int numSamples = audioBuffer.getNumSamples();
+                const int numSamples = range.end - range.start;
                 const int numChannels = audioBuffer.getNumChannels();
 
                 // Create output buffer (same size - we're correcting, not changing duration)
@@ -2357,7 +3990,7 @@ void StandaloneWindow::wowFlutterRemoval()
 
                 for (int ch = 0; ch < numChannels; ++ch)
                 {
-                    const float* input = audioBuffer.getReadPointer (ch);
+                    const float* input = audioBuffer.getReadPointer (ch) + range.start;
                     float* output = outputBuffer.getWritePointer (ch);
 
                     // Track cumulative phase for input position
@@ -2406,7 +4039,8 @@ void StandaloneWindow::wowFlutterRemoval()
                 }
 
                 // Copy result back
-                audioBuffer = outputBuffer;
+                for (int ch = 0; ch < numChannels; ++ch)
+                    audioBuffer.copyFrom (ch, range.start, outputBuffer, ch, 0, numSamples);
 
                 // Update display
                 mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
@@ -2460,6 +4094,16 @@ void StandaloneWindow::dropoutRestoration()
         {
             if (result == 1)
             {
+                auto range = getProcessingRange();
+                if (range.end <= range.start)
+                {
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                            "Invalid Selection",
+                                                            "Selection range is empty.");
+                    delete dialog;
+                    return;
+                }
+
                 // Save state for undo
                 undoManager.saveState (audioBuffer, sampleRate, "Dropout Restoration");
 
@@ -2480,8 +4124,8 @@ void StandaloneWindow::dropoutRestoration()
                 // Detect and repair dropouts for each channel
                 for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
                 {
-                    float* channelData = audioBuffer.getWritePointer (ch);
-                    int numSamples = audioBuffer.getNumSamples();
+                    float* channelData = audioBuffer.getWritePointer (ch) + range.start;
+                    int numSamples = range.end - range.start;
 
                     int dropoutStart = -1;
 
@@ -2519,7 +4163,7 @@ void StandaloneWindow::dropoutRestoration()
                                 else if (method == 1 && audioBuffer.getNumChannels() > 1) // Copy from other channel
                                 {
                                     int otherCh = (ch == 0) ? 1 : 0;
-                                    const float* otherData = audioBuffer.getReadPointer (otherCh);
+                                    const float* otherData = audioBuffer.getReadPointer (otherCh) + range.start;
 
                                     for (int j = dropoutStart; j < i; ++j)
                                     {
@@ -2618,6 +4262,16 @@ void StandaloneWindow::speedCorrection()
                     return;
                 }
 
+                auto range = getProcessingRange();
+                if (range.end <= range.start)
+                {
+                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                            "Invalid Selection",
+                                                            "Selection range is empty.");
+                    delete dialog;
+                    return;
+                }
+
                 // Save state for undo
                 undoManager.saveState (audioBuffer, sampleRate, "Speed Correction");
 
@@ -2625,28 +4279,29 @@ void StandaloneWindow::speedCorrection()
 
                 // Calculate new length
                 float speedRatio = 100.0f / speedPercent;
-                int newNumSamples = static_cast<int> (audioBuffer.getNumSamples() * speedRatio);
+                int selectionSamples = range.end - range.start;
+                int newSelectionSamples = static_cast<int> (selectionSamples * speedRatio);
 
-                // Create new buffer with interpolated samples
-                juce::AudioBuffer<float> newBuffer (audioBuffer.getNumChannels(), newNumSamples);
+                // Create new buffer for processed selection
+                juce::AudioBuffer<float> processedSelection (audioBuffer.getNumChannels(), newSelectionSamples);
 
                 for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
                 {
-                    const float* srcData = audioBuffer.getReadPointer (ch);
-                    float* destData = newBuffer.getWritePointer (ch);
+                    const float* srcData = audioBuffer.getReadPointer (ch) + range.start;
+                    float* destData = processedSelection.getWritePointer (ch);
 
-                    for (int i = 0; i < newNumSamples; ++i)
+                    for (int i = 0; i < newSelectionSamples; ++i)
                     {
                         // Calculate source position with linear interpolation
                         float srcPos = i / speedRatio;
                         int srcIdx = static_cast<int> (srcPos);
                         float frac = srcPos - srcIdx;
 
-                        if (srcIdx + 1 < audioBuffer.getNumSamples())
+                        if (srcIdx + 1 < selectionSamples)
                         {
                             destData[i] = srcData[srcIdx] * (1.0f - frac) + srcData[srcIdx + 1] * frac;
                         }
-                        else if (srcIdx < audioBuffer.getNumSamples())
+                        else if (srcIdx < selectionSamples)
                         {
                             destData[i] = srcData[srcIdx];
                         }
@@ -2657,12 +4312,29 @@ void StandaloneWindow::speedCorrection()
                     }
                 }
 
-                // Replace buffer
+                // Assemble new full buffer
+                int newTotalSamples = audioBuffer.getNumSamples() - selectionSamples + newSelectionSamples;
+                juce::AudioBuffer<float> newBuffer (audioBuffer.getNumChannels(), newTotalSamples);
+
+                for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+                {
+                    newBuffer.copyFrom (ch, 0, audioBuffer, ch, 0, range.start);
+                    newBuffer.copyFrom (ch, range.start, processedSelection, ch, 0, newSelectionSamples);
+                    int afterStart = range.end;
+                    int afterLength = audioBuffer.getNumSamples() - afterStart;
+                    if (afterLength > 0)
+                    {
+                        newBuffer.copyFrom (ch, range.start + newSelectionSamples,
+                                            audioBuffer, ch, afterStart, afterLength);
+                    }
+                }
+
                 audioBuffer = newBuffer;
 
                 // Update display
                 mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
                 mainComponent->setAudioBuffer (&audioBuffer, sampleRate);
+                mainComponent->getWaveformDisplay().setSelection (range.start, range.start + newSelectionSamples);
 
                 hasUnsavedChanges = true;
                 updateTitle();
@@ -2717,16 +4389,39 @@ void StandaloneWindow::turntableAnalyzer()
                 juce::String brand = dialog->getTextEditorContents ("brand");
                 juce::String model = dialog->getTextEditorContents ("model");
 
-                mainComponent->getCorrectionListView().setStatusText ("Analyzing turntable quality...");
+                auto range = getProcessingRange();
+                const juce::AudioBuffer<float>* analysisBuffer = &audioBuffer;
+                juce::AudioBuffer<float> selectionBuffer;
+
+                if (range.hasSelection)
+                {
+                    const int selectionSamples = range.end - range.start;
+                    if (selectionSamples <= 0)
+                    {
+                        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                                "Invalid Selection",
+                                                                "Selection range is empty.");
+                        delete dialog;
+                        return;
+                    }
+
+                    selectionBuffer.setSize (audioBuffer.getNumChannels(), selectionSamples);
+                    for (int ch = 0; ch < audioBuffer.getNumChannels(); ++ch)
+                        selectionBuffer.copyFrom (ch, 0, audioBuffer, ch, range.start, selectionSamples);
+                    analysisBuffer = &selectionBuffer;
+                }
+
+                mainComponent->getCorrectionListView().setStatusText ("Analyzing turntable quality in " +
+                                                                      (range.hasSelection ? range.rangeInfo : "whole file") + "...");
 
                 //==============================================================
                 // TURNTABLE QUALITY ANALYSIS
                 //==============================================================
 
-                const int numSamples = audioBuffer.getNumSamples();
-                const int numChannels = audioBuffer.getNumChannels();
-                const float* dataL = audioBuffer.getReadPointer (0);
-                const float* dataR = numChannels > 1 ? audioBuffer.getReadPointer (1) : dataL;
+                const int numSamples = analysisBuffer->getNumSamples();
+                const int numChannels = analysisBuffer->getNumChannels();
+                const float* dataL = analysisBuffer->getReadPointer (0);
+                const float* dataR = numChannels > 1 ? analysisBuffer->getReadPointer (1) : dataL;
 
                 // Determine RPM and wow frequency
                 float rpm = (rpmIndex == 0) ? 33.333f : (rpmIndex == 1) ? 45.0f : (rpmIndex == 2) ? 78.0f : 33.333f;
@@ -3016,7 +4711,7 @@ void StandaloneWindow::showAudioSettings()
     options.content.setOwned (new juce::AudioDeviceSelectorComponent (
         audioDeviceManager,
         0,  // min input channels
-        0,  // max input channels
+        2,  // max input channels
         2,  // min output channels
         2,  // max output channels
         false,  // show MIDI input
@@ -3026,6 +4721,216 @@ void StandaloneWindow::showAudioSettings()
     ));
     options.content->setSize (500, 400);
     options.launchAsync();
+}
+
+void StandaloneWindow::showProcessingSettings()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "AI/Processing Settings";
+    options.dialogBackgroundColour = juce::Colours::darkgrey;
+    options.useNativeTitleBar = true;
+
+    auto applyCallback = [this]()
+    {
+        applyDenoiserSettings();
+    };
+
+    auto activeProviderCallback = [this]()
+    {
+        return OnnxDenoiser::providerToString (realtimeDenoiser.getActiveProvider());
+    };
+
+    auto* content = new SettingsComponent (applyCallback, activeProviderCallback, true);
+    options.content.setOwned (content);
+    options.content->setSize (700, 520);
+    options.launchAsync();
+}
+
+void StandaloneWindow::applyDenoiserSettings()
+{
+    const auto settings = SettingsManager::getInstance().getDenoiseSettings();
+    realtimeDenoiser.setPreferredProvider (OnnxDenoiser::providerFromString (settings.provider));
+    realtimeDenoiser.setAllowFallback (settings.allowFallback);
+    realtimeDenoiser.setDmlDeviceId (settings.dmlDeviceId);
+    realtimeDenoiser.setQnnBackendPath (settings.qnnBackendPath);
+
+    if (settings.modelPath.isNotEmpty())
+        realtimeDenoiser.setModelPath (juce::File (settings.modelPath));
+    else
+        realtimeDenoiser.clearModelPath();
+}
+
+void StandaloneWindow::toggleRecording()
+{
+    if (isRecording)
+        stopRecording();
+    else
+        startRecording();
+}
+
+void StandaloneWindow::startRecording()
+{
+    if (isRecording)
+        return;
+
+    if (!promptToSaveIfNeeded ("starting a recording"))
+    {
+        setRecordingState (false);
+        return;
+    }
+
+    auto* device = audioDeviceManager.getCurrentAudioDevice();
+    if (device == nullptr)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Recording Unavailable",
+                                               "No audio device is available.");
+        setRecordingState (false);
+        return;
+    }
+
+    const int inputChannels = device->getActiveInputChannels().countNumberOfSetBits();
+    if (inputChannels <= 0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Recording Unavailable",
+                                               "No input channels are enabled. Check Audio Settings.");
+        setRecordingState (false);
+        return;
+    }
+
+    const double deviceSampleRate = device->getCurrentSampleRate();
+    if (deviceSampleRate <= 0.0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Recording Unavailable",
+                                               "The audio device sample rate is invalid.");
+        setRecordingState (false);
+        return;
+    }
+
+    transportSource.stop();
+    transportSource.setPosition (0.0);
+    isPlaying = false;
+
+    if (recorder == nullptr)
+        recorder = std::make_unique<AudioRecorder>();
+
+    if (!recorder->startRecording (deviceSampleRate, juce::jmin (2, inputChannels)))
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Recording Failed",
+                                               "Could not start the recording.");
+        setRecordingState (false);
+        return;
+    }
+
+    bufferedRecording.reset();
+    setRecordingState (true);
+
+    if (mainComponent != nullptr)
+        mainComponent->getCorrectionListView().setStatusText ("Recording (buffered)...");
+}
+
+void StandaloneWindow::stopRecording()
+{
+    if (!isRecording)
+        return;
+
+    juce::MemoryBlock recordedData;
+    if (recorder != nullptr)
+    {
+        recorder->stop();
+        recordedData = recorder->takeRecordingData();
+    }
+
+    setRecordingState (false);
+
+    if (recordedData.getSize() == 0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Recording Empty",
+                                               "No audio data was captured.");
+        return;
+    }
+
+    if (mainComponent != nullptr)
+        mainComponent->getCorrectionListView().setStatusText ("Loading buffered recording...");
+
+    loadRecordingFromMemory (std::move (recordedData));
+}
+
+void StandaloneWindow::loadRecordingFromMemory (juce::MemoryBlock&& data)
+{
+    bufferedRecording = std::move (data);
+    if (bufferedRecording.getSize() == 0)
+        return;
+
+    transportSource.stop();
+    transportSource.setSource (nullptr);
+    readerSource.reset();
+    isPlaying = false;
+
+    juce::AudioFormatManager formatManager;
+    formatManager.registerBasicFormats();
+    formatManager.registerFormat (new juce::FlacAudioFormat(), true);
+    formatManager.registerFormat (new juce::OggVorbisAudioFormat(), true);
+
+   #if JUCE_USE_MP3AUDIOFORMAT
+    formatManager.registerFormat (new juce::MP3AudioFormat(), true);
+   #endif
+
+    auto memoryStream = std::make_unique<juce::MemoryInputStream> (bufferedRecording.getData(),
+                                                                   bufferedRecording.getSize(),
+                                                                   false);
+    std::unique_ptr<juce::AudioFormatReader> reader (
+        formatManager.createReaderFor (std::move (memoryStream)));
+
+    if (reader == nullptr)
+    {
+        bufferedRecording.reset();
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                               "Load Failed",
+                                               "Could not decode the buffered recording.");
+        return;
+    }
+
+    sampleRate = reader->sampleRate;
+    const int numChannels = static_cast<int> (reader->numChannels);
+    const int numSamples = static_cast<int> (reader->lengthInSamples);
+
+    audioBuffer.setSize (numChannels, numSamples);
+    reader->read (&audioBuffer, 0, numSamples, 0, true, true);
+
+    readerSource.reset (new juce::AudioFormatReaderSource (reader.release(), true));
+    transportSource.setSource (readerSource.get(), 0, nullptr, sampleRate);
+
+    if (mainComponent != nullptr)
+    {
+        mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
+        mainComponent->getWaveformDisplay().clearSelection();
+        mainComponent->setAudioBuffer (&audioBuffer, sampleRate);
+        mainComponent->getCorrectionListView().clearCorrections();
+        mainComponent->getCorrectionListView().setStatusText ("Recording loaded (buffered). Use Export Audio to save.");
+    }
+
+    undoManager.clear();
+    currentFile = juce::File();
+    currentSessionFile = juce::File();
+    hasUnsavedChanges = false;
+    updateTitle();
+}
+
+void StandaloneWindow::setRecordingState (bool recording)
+{
+    isRecording = recording;
+    if (mainComponent != nullptr)
+    {
+        mainComponent->setRecording (recording);
+        mainComponent->setTransportTime (0.0);
+    }
+
+    menuItemsChanged();
 }
 
 void StandaloneWindow::setUIScale (float newScale)
@@ -3132,17 +5037,33 @@ StandaloneWindow::MainComponent::MainComponent()
     addAndMakeVisible (rewindButton);
     addAndMakeVisible (playPauseButton);
     addAndMakeVisible (stopButton);
+    addAndMakeVisible (recordButton);
     addAndMakeVisible (forwardButton);
+    addAndMakeVisible (loopSelectionButton);
+    addAndMakeVisible (zoomToSelectionButton);
 
     rewindButton.addListener (this);
     playPauseButton.addListener (this);
     stopButton.addListener (this);
+    recordButton.addListener (this);
     forwardButton.addListener (this);
+    loopSelectionButton.addListener (this);
+    zoomToSelectionButton.addListener (this);
 
     rewindButton.setTooltip ("Skip backward 5 seconds");
     playPauseButton.setTooltip ("Play/Pause playback (Spacebar)");
     stopButton.setTooltip ("Stop playback and return to start");
+    recordButton.setTooltip ("Start recording");
     forwardButton.setTooltip ("Skip forward 5 seconds");
+    loopSelectionButton.setTooltip ("Loop playback within selection");
+    loopSelectionButton.setClickingTogglesState (true);
+    zoomToSelectionButton.setTooltip ("Zoom to current selection");
+    timeLabel.setTooltip ("Current playback time");
+
+    recordButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff5a1f1f));
+    recordButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffc0392b));
+    recordButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    recordButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
 
     // Enable keyboard focus for spacebar control
     setWantsKeyboardFocus (true);
@@ -3174,6 +5095,9 @@ StandaloneWindow::MainComponent::MainComponent()
     volumeLabel.setText ("Volume", juce::dontSendNotification);
     volumeLabel.setJustificationType (juce::Justification::centred);
 
+    // Volume meter
+    addAndMakeVisible (volumeMeter);
+
     // Zoom controls
     addAndMakeVisible (zoomInButton);
     addAndMakeVisible (zoomOutButton);
@@ -3196,6 +5120,7 @@ StandaloneWindow::MainComponent::MainComponent()
     horizontalZoomSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
     horizontalZoomSlider.addListener (this);
     horizontalZoomSlider.setTooltip ("Horizontal zoom (1x to 100x)");
+    horizontalZoomSlider.setDoubleClickReturnValue (true, 1.0);
 
     addAndMakeVisible (horizontalZoomLabel);
     horizontalZoomLabel.setText ("H-Zoom:", juce::dontSendNotification);
@@ -3210,6 +5135,7 @@ StandaloneWindow::MainComponent::MainComponent()
     verticalZoomSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 50, 20);
     verticalZoomSlider.addListener (this);
     verticalZoomSlider.setTooltip ("Vertical zoom (amplitude)");
+    verticalZoomSlider.setDoubleClickReturnValue (true, 1.0);
 
     addAndMakeVisible (verticalZoomLabel);
     verticalZoomLabel.setText ("V-Zoom", juce::dontSendNotification);
@@ -3630,8 +5556,8 @@ void StandaloneWindow::MainComponent::resized()
     auto toolbarArea = area.removeFromTop (36);
     toolbarArea.reduce (10, 3);
 
-    // Reserve space on right for logo/volume area (90px to match volume area + margin)
-    toolbarArea.removeFromRight (90);
+    // Reserve space on right for logo/volume area (100px to match volume area + margin)
+    toolbarArea.removeFromRight (100);
 
     const int btnWidth = 60;
     const int btnSpacing = 3;
@@ -3664,8 +5590,8 @@ void StandaloneWindow::MainComponent::resized()
     toolbarArea.removeFromRight (btnSpacing);
     toolbarSpectrumButton.setBounds (toolbarArea.removeFromRight (btnWidth + 15));
 
-    // Volume slider uses right side of window (80px wide), but leave room for logo at top
-    auto volumeArea = area.removeFromRight (80);
+    // Volume slider uses right side of window (100px wide), but leave room for logo at top
+    auto volumeArea = area.removeFromRight (100);
     volumeArea.reduce (10, 10);
 
     // Leave space at top for the logo (logo is ~60px wide, ~100px tall with padding)
@@ -3678,7 +5604,10 @@ void StandaloneWindow::MainComponent::resized()
     // The slider has TextBoxBelow which adds ~20px, so leave some margin
     volumeArea.removeFromBottom (25);  // Space for slider's built-in text box
 
-    // Volume slider fills remaining vertical space (shorter now)
+    // Volume meter + slider fills remaining vertical space (shorter now)
+    auto meterArea = volumeArea.removeFromLeft (28);
+    meterArea.reduce (2, 0);
+    volumeMeter.setBounds (meterArea);
     volumeSlider.setBounds (volumeArea);
 
     // Left side contains all other content
@@ -3694,7 +5623,13 @@ void StandaloneWindow::MainComponent::resized()
     transportArea.removeFromLeft (5);
     stopButton.setBounds (transportArea.removeFromLeft (60));
     transportArea.removeFromLeft (5);
+    recordButton.setBounds (transportArea.removeFromLeft (60));
+    transportArea.removeFromLeft (5);
     forwardButton.setBounds (transportArea.removeFromLeft (50));
+    transportArea.removeFromLeft (5);
+    loopSelectionButton.setBounds (transportArea.removeFromLeft (80));
+    transportArea.removeFromLeft (5);
+    zoomToSelectionButton.setBounds (transportArea.removeFromLeft (90));
     transportArea.removeFromLeft (10);
 
     // Time label and position slider
@@ -3704,9 +5639,18 @@ void StandaloneWindow::MainComponent::resized()
 
     // Constants for control heights
     const int resizerHeight = 10;
+    const int zoomRowHeight = 40;
+    const int selectionRowHeight = 35;
+    const int statusRowHeight = 30;
 
-    // Waveform area - use stored height
-    auto waveformArea = area.removeFromTop (waveformHeight);
+    // Waveform area - use stored height or fill when list hidden
+    int desiredWaveformHeight = waveformHeight;
+    if (!correctionListVisible)
+    {
+        int remaining = area.getHeight() - (resizerHeight + zoomRowHeight + 5 + selectionRowHeight + 5 + statusRowHeight);
+        desiredWaveformHeight = juce::jmax (100, remaining);
+    }
+    auto waveformArea = area.removeFromTop (desiredWaveformHeight);
 
     // Vertical zoom slider on left side of waveform
     auto vZoomArea = waveformArea.removeFromLeft (50);
@@ -3719,10 +5663,13 @@ void StandaloneWindow::MainComponent::resized()
     waveformDisplay.setBounds (waveformArea);
 
     // Resizer divider between waveform and controls
-    resizeDivider.setBounds (area.removeFromTop (resizerHeight));
+    if (correctionListVisible)
+        resizeDivider.setBounds (area.removeFromTop (resizerHeight));
+    else
+        resizeDivider.setBounds (0, 0, 0, 0);
 
     // Zoom buttons + horizontal zoom slider directly under resizer (same row)
-    auto zoomButtonArea = area.removeFromTop (40);
+    auto zoomButtonArea = area.removeFromTop (zoomRowHeight);
     zoomButtonArea.reduce (10, 5);
 
     zoomInButton.setBounds (zoomButtonArea.removeFromLeft (40));
@@ -3740,7 +5687,7 @@ void StandaloneWindow::MainComponent::resized()
     area.removeFromTop (5); // Small gap
 
     // Selection editor directly under zoom buttons
-    auto selectionArea = area.removeFromTop (35);
+    auto selectionArea = area.removeFromTop (selectionRowHeight);
     selectionArea.reduce (10, 5);
 
     selectionStartLabel.setBounds (selectionArea.removeFromLeft (45));
@@ -3761,12 +5708,15 @@ void StandaloneWindow::MainComponent::resized()
     area.removeFromTop (5); // Small gap
 
     // Status bar at bottom
-    auto statusArea = area.removeFromBottom (30);
+    auto statusArea = area.removeFromBottom (statusRowHeight);
     statusArea.reduce (10, 5);
     statusLabel.setBounds (statusArea);
 
     // Correction list takes remaining space
-    correctionListView.setBounds (area);
+    if (correctionListVisible)
+        correctionListView.setBounds (area);
+    else
+        correctionListView.setBounds (0, 0, 0, 0);
 }
 
 void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
@@ -3786,6 +5736,7 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
             else
             {
                 // Play/Resume
+                seekToSelectionStart();
                 parentWindow->transportSource.start();
                 parentWindow->isPlaying = true;
                 playPauseButton.setButtonText ("Pause");
@@ -3825,6 +5776,11 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
             }
         }
     }
+    else if (button == &recordButton)
+    {
+        if (parentWindow)
+            parentWindow->toggleRecording();
+    }
     else if (button == &rewindButton)
     {
         // Skip backward 5 seconds
@@ -3850,24 +5806,15 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
     }
     else if (button == &zoomInButton)
     {
-        // Zoom in = increase zoom multiplier
-        double newZoom = waveformDisplay.horizontalZoom * 2.0;
-        waveformDisplay.setHorizontalZoom (newZoom);
-        horizontalZoomSlider.setValue (newZoom, juce::dontSendNotification);
+        zoomIn();
     }
     else if (button == &zoomOutButton)
     {
-        // Zoom out = decrease zoom multiplier
-        double newZoom = juce::jmax (1.0, waveformDisplay.horizontalZoom * 0.5);
-        waveformDisplay.setHorizontalZoom (newZoom);
-        horizontalZoomSlider.setValue (newZoom, juce::dontSendNotification);
+        zoomOut();
     }
     else if (button == &zoomFitButton)
     {
-        // Fit entire waveform
-        waveformDisplay.setHorizontalZoom (1.0);
-        waveformDisplay.scrollPosition = 0.0;
-        horizontalZoomSlider.setValue (1.0, juce::dontSendNotification);
+        zoomFit();
     }
     else if (button == &clearSelectionButton)
     {
@@ -3879,6 +5826,17 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
         selectionLengthLabel.setText ("Length: 00:00.000", juce::dontSendNotification);
 
         DBG ("Selection cleared");
+    }
+    else if (button == &loopSelectionButton)
+    {
+        // Toggle button handles its own state
+    }
+    else if (button == &zoomToSelectionButton)
+    {
+        if (waveformDisplay.zoomToSelection())
+        {
+            horizontalZoomSlider.setValue (waveformDisplay.horizontalZoom, juce::dontSendNotification);
+        }
     }
     //==============================================================================
     // Toolbar button handlers
@@ -3935,6 +5893,27 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
     }
 }
 
+void StandaloneWindow::MainComponent::zoomIn()
+{
+    double newZoom = waveformDisplay.horizontalZoom * 2.0;
+    waveformDisplay.setHorizontalZoom (newZoom);
+    horizontalZoomSlider.setValue (newZoom, juce::dontSendNotification);
+}
+
+void StandaloneWindow::MainComponent::zoomOut()
+{
+    double newZoom = juce::jmax (1.0, waveformDisplay.horizontalZoom * 0.5);
+    waveformDisplay.setHorizontalZoom (newZoom);
+    horizontalZoomSlider.setValue (newZoom, juce::dontSendNotification);
+}
+
+void StandaloneWindow::MainComponent::zoomFit()
+{
+    waveformDisplay.setHorizontalZoom (1.0);
+    waveformDisplay.scrollPosition = 0.0;
+    horizontalZoomSlider.setValue (1.0, juce::dontSendNotification);
+}
+
 void StandaloneWindow::MainComponent::sliderValueChanged (juce::Slider* slider)
 {
     if (slider == &positionSlider)
@@ -3949,10 +5928,7 @@ void StandaloneWindow::MainComponent::sliderValueChanged (juce::Slider* slider)
             parentWindow->transportSource.setPosition (timeInSeconds);
 
             // Update time label
-            int minutes = (int) (timeInSeconds / 60.0);
-            double seconds = timeInSeconds - minutes * 60;
-            juce::String timeString = juce::String::formatted ("%02d:%06.3f", minutes, seconds);
-            timeLabel.setText (timeString, juce::dontSendNotification);
+            setTransportTime (timeInSeconds);
         }
     }
     else if (slider == &volumeSlider)
@@ -3983,6 +5959,63 @@ void StandaloneWindow::MainComponent::sliderValueChanged (juce::Slider* slider)
 
 bool StandaloneWindow::MainComponent::keyPressed (const juce::KeyPress& key)
 {
+    if (key.getModifiers().isCtrlDown() || key.getModifiers().isCommandDown())
+    {
+        if (key.getKeyCode() == 'z' || key.getKeyCode() == 'Z')
+        {
+            if (parentWindow)
+                parentWindow->menuItemSelected (StandaloneWindow::editUndo, 0);
+            return true;
+        }
+        if (key.getKeyCode() == 'y' || key.getKeyCode() == 'Y')
+        {
+            if (parentWindow)
+                parentWindow->menuItemSelected (StandaloneWindow::editRedo, 0);
+            return true;
+        }
+        if (key.getKeyCode() == 'a' || key.getKeyCode() == 'A')
+        {
+            if (parentWindow)
+                parentWindow->menuItemSelected (StandaloneWindow::editSelectAll, 0);
+            return true;
+        }
+        if (key.getKeyCode() == 'g' || key.getKeyCode() == 'G')
+        {
+            if (parentWindow)
+                parentWindow->menuItemSelected (StandaloneWindow::viewShowSpectrogram, 0);
+            return true;
+        }
+        if (key.getKeyCode() == 'q' || key.getKeyCode() == 'Q')
+        {
+            if (parentWindow)
+                parentWindow->requestAppQuit();
+            return true;
+        }
+        if (key.getKeyCode() == 'r' || key.getKeyCode() == 'R')
+        {
+            if (parentWindow)
+                parentWindow->toggleRecording();
+            return true;
+        }
+
+        juce::juce_wchar keyChar = key.getTextCharacter();
+        if (keyChar == '+' || keyChar == '=')
+        {
+            zoomIn();
+            return true;
+        }
+        if (keyChar == '-' || keyChar == '_')
+        {
+            zoomOut();
+            return true;
+        }
+        if (keyChar == '0')
+        {
+            zoomFit();
+            return true;
+        }
+    }
+
     // Spacebar toggles play/pause
     if (key == juce::KeyPress::spaceKey)
     {
@@ -3999,6 +6032,7 @@ bool StandaloneWindow::MainComponent::keyPressed (const juce::KeyPress& key)
             else
             {
                 // Start/resume playback
+                seekToSelectionStart();
                 parentWindow->transportSource.start();
                 parentWindow->isPlaying = true;
                 playPauseButton.setButtonText ("Pause");
@@ -4075,4 +6109,67 @@ void StandaloneWindow::MainComponent::updatePlaybackPosition (double position)
 {
     positionSlider.setValue (position, juce::dontSendNotification);
     waveformDisplay.setPlaybackPosition (position);
+}
+
+void StandaloneWindow::MainComponent::setMeterLevel (float leftLevel, float rightLevel)
+{
+    volumeMeter.setLevels (leftLevel, rightLevel);
+}
+
+void StandaloneWindow::MainComponent::setCorrectionListVisible (bool visible)
+{
+    correctionListVisible = visible;
+    correctionListView.setVisible (visible);
+    resizeDivider.setVisible (visible);
+    resized();
+}
+
+void StandaloneWindow::MainComponent::setRecording (bool recording)
+{
+    recordButton.setToggleState (recording, juce::dontSendNotification);
+    recordButton.setButtonText (recording ? "REC" : "Rec");
+    recordButton.setTooltip (recording ? "Stop recording" : "Start recording");
+    if (recording)
+        playPauseButton.setButtonText ("Play");
+
+    playPauseButton.setEnabled (!recording);
+    stopButton.setEnabled (!recording);
+    rewindButton.setEnabled (!recording);
+    forwardButton.setEnabled (!recording);
+    loopSelectionButton.setEnabled (!recording);
+    zoomToSelectionButton.setEnabled (!recording);
+    positionSlider.setEnabled (!recording);
+}
+
+void StandaloneWindow::MainComponent::setTransportTime (double seconds)
+{
+    int minutes = (int) (seconds / 60.0);
+    double remSeconds = seconds - minutes * 60;
+    juce::String timeString = juce::String::formatted ("%02d:%06.3f", minutes, remSeconds);
+    timeLabel.setText (timeString, juce::dontSendNotification);
+}
+
+bool StandaloneWindow::MainComponent::seekToSelectionStart()
+{
+    if (parentWindow == nullptr || currentBuffer == nullptr || currentSampleRate <= 0.0)
+        return false;
+
+    int64_t selStart = -1, selEnd = -1;
+    waveformDisplay.getSelection (selStart, selEnd);
+
+    if (selStart < 0 || selEnd <= selStart)
+        return false;
+
+    double startSeconds = selStart / currentSampleRate;
+    parentWindow->transportSource.setPosition (startSeconds);
+
+    double totalLength = currentBuffer->getNumSamples() / currentSampleRate;
+    if (totalLength > 0.0)
+    {
+        double position = startSeconds / totalLength;
+        positionSlider.setValue (position, juce::dontSendNotification);
+        waveformDisplay.setPlaybackPosition (position);
+    }
+
+    return true;
 }

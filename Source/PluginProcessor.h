@@ -5,6 +5,7 @@
 #include "DSP/ClickRemoval.h"
 #include "DSP/NoiseReduction.h"
 #include "DSP/FilterBank.h"
+#include "DSP/OnnxDenoiser.h"
 
 //==============================================================================
 /**
@@ -65,6 +66,8 @@ public:
     ClickRemoval& getClickRemoval() { return clickRemoval; }
     NoiseReduction& getNoiseReduction() { return noiseReduction; }
     FilterBank& getFilterBank() { return filterBank; }
+    OnnxDenoiser& getOnnxDenoiser() { return onnxDenoiser; }
+    void applyDenoiserSettings();
 
     // Get audio for spectrum analyzer visualization
     const juce::AudioBuffer<float>& getVisualizationBuffer() const { return visualizationBuffer; }
@@ -78,15 +81,22 @@ private:
     ClickRemoval clickRemoval;
     NoiseReduction noiseReduction;
     FilterBank filterBank;
+    OnnxDenoiser onnxDenoiser;
 
     // Parameter listeners
     std::atomic<float>* clickSensitivityParam = nullptr;
     std::atomic<float>* noiseReductionParam = nullptr;
     std::atomic<float>* rumbleFilterParam = nullptr;
     std::atomic<float>* humFilterParam = nullptr;
+    std::atomic<float>* aiDenoiseEnableParam = nullptr;
+    std::atomic<float>* aiDenoiseMixParam = nullptr;
 
     // Audio buffer for spectrum analyzer visualization
     juce::AudioBuffer<float> visualizationBuffer;
+
+    double lastSampleRate = 0.0;
+    int lastBlockSize = 0;
+    int lastNumChannels = 0;
 
     // Create parameter layout
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();

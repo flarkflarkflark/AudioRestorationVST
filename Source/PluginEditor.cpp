@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "GUI/SettingsComponent.h"
 
 //==============================================================================
 AudioRestorationEditor::AudioRestorationEditor (AudioRestorationProcessor& p)
@@ -31,6 +32,10 @@ AudioRestorationEditor::AudioRestorationEditor (AudioRestorationProcessor& p)
     scaleSelector.addItem ("400%", 9);
     scaleSelector.setSelectedId (4); // Default 100%
     addAndMakeVisible (scaleSelector);
+
+    settingsButton.setTooltip ("AI and dependency settings");
+    settingsButton.addListener (this);
+    addAndMakeVisible (settingsButton);
 
     scaleSelector.onChange = [this]
     {
@@ -239,6 +244,7 @@ AudioRestorationEditor::AudioRestorationEditor (AudioRestorationProcessor& p)
 AudioRestorationEditor::~AudioRestorationEditor()
 {
     stopTimer();
+    settingsButton.removeListener (this);
 
     // Reset LookAndFeel to avoid dangling pointers
     clickSensitivitySlider.setLookAndFeel (nullptr);
@@ -463,6 +469,8 @@ void AudioRestorationEditor::resized()
 
     // Title area with scale selector on the right
     auto titleArea = area.removeFromTop (40);
+    auto settingsArea = titleArea.removeFromRight (110);
+    settingsButton.setBounds (settingsArea.reduced (4, 6));
     auto scaleArea = titleArea.removeFromRight (180);
     scaleLabel.setBounds (scaleArea.removeFromLeft (70));
     scaleSelector.setBounds (scaleArea.removeFromLeft (100).reduced (0, 5));
@@ -575,5 +583,31 @@ void AudioRestorationEditor::resized()
                 eqLabels[i]->setBounds (labelArea);
             }
         }
+    }
+}
+
+void AudioRestorationEditor::buttonClicked (juce::Button* button)
+{
+    if (button == &settingsButton)
+    {
+        juce::DialogWindow::LaunchOptions options;
+        options.dialogTitle = "AI/Processing Settings";
+        options.dialogBackgroundColour = juce::Colours::darkgrey;
+        options.useNativeTitleBar = true;
+
+        auto applyCallback = [this]()
+        {
+            audioProcessor.applyDenoiserSettings();
+        };
+
+        auto activeProviderCallback = [this]()
+        {
+            return OnnxDenoiser::providerToString (audioProcessor.getOnnxDenoiser().getActiveProvider());
+        };
+
+        auto* content = new SettingsComponent (applyCallback, activeProviderCallback, false);
+        options.content.setOwned (content);
+        options.content->setSize (700, 520);
+        options.launchAsync();
     }
 }

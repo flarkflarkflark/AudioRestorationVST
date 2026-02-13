@@ -17,7 +17,8 @@
  * - Real-time spectrum analyzer
  */
 class AudioRestorationEditor  : public juce::AudioProcessorEditor,
-                                 private juce::Timer
+                                 private juce::Timer,
+                                 private juce::Button::Listener
 {
 public:
     AudioRestorationEditor (AudioRestorationProcessor&);
@@ -35,6 +36,7 @@ public:
     //==============================================================================
     // Visual Feedback Timer
     void timerCallback() override;
+    void buttonClicked (juce::Button* button) override;
 
 private:
     AudioRestorationProcessor& audioProcessor;
@@ -52,6 +54,7 @@ private:
     juce::Label scaleLabel;
     juce::ToggleButton differenceModeButton;
     juce::Label differenceModeLabel;
+    juce::TextButton settingsButton {"Settings"};
 
     // Click Removal Section
     juce::GroupComponent clickGroup;

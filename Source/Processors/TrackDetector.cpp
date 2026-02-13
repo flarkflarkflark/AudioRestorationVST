@@ -101,6 +101,7 @@ std::vector<TrackDetector::TrackBoundary> TrackDetector::detectTracks (const juc
     // Store detected boundaries
     boundaries = detectedBoundaries;
     sortBoundaries();
+    trackNames.clear();
 
     return boundaries;
 }
@@ -122,6 +123,19 @@ void TrackDetector::removeBoundary (int index)
 void TrackDetector::clearBoundaries()
 {
     boundaries.clear();
+    trackNames.clear();
+}
+
+void TrackDetector::setBoundaries (const std::vector<TrackBoundary>& newBoundaries)
+{
+    boundaries = newBoundaries;
+    sortBoundaries();
+    trackNames.clear();
+}
+
+void TrackDetector::setTrackNames (const juce::StringArray& names)
+{
+    trackNames = names;
 }
 
 std::vector<juce::AudioBuffer<float>> TrackDetector::splitIntoTracks (const juce::AudioBuffer<float>& buffer,
@@ -225,9 +239,16 @@ bool TrackDetector::exportTracks (const juce::AudioBuffer<float>& buffer,
     {
         juce::String trackName = baseName + "_Track_" + juce::String ((int) (i + 1));
 
-        // Use custom name if available
-        if (i < boundaries.size() && boundaries[i].name.isNotEmpty())
+        // Prefer track names (if provided) then boundary names
+        if (trackNames.size() == (int) tracks.size())
+        {
+            if (trackNames[(int) i].isNotEmpty())
+                trackName = baseName + "_" + trackNames[(int) i];
+        }
+        else if (i < boundaries.size() && boundaries[i].name.isNotEmpty())
+        {
             trackName = baseName + "_" + boundaries[i].name;
+        }
 
         juce::File outputFile = outputDirectory.getChildFile (trackName + "." + extension);
 

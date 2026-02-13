@@ -13,7 +13,7 @@ public:
     VinylRestorationApplication() {}
 
     const juce::String getApplicationName() override       { return "Vinyl Restoration Suite"; }
-    const juce::String getApplicationVersion() override    { return "1.5.2"; }
+    const juce::String getApplicationVersion() override    { return "1.6.1"; }
     bool moreThanOneInstanceAllowed() override             { return true; }
 
     //==============================================================================
@@ -33,7 +33,10 @@ public:
     //==============================================================================
     void systemRequestedQuit() override
     {
-        quit();
+        if (mainWindow != nullptr)
+            mainWindow->requestAppQuit();
+        else
+            quit();
     }
 
     void anotherInstanceStarted (const juce::String& commandLine) override

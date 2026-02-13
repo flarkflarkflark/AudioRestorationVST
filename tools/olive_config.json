@@ -1,0 +1,18 @@
+{
+  "input_model": {
+    "type": "OnnxModel",
+    "config": { "model_path": "models\rnnoise_48k.onnx" }
+  },
+  "systems": {
+    "local_system": { "type": "LocalSystem" }
+  },
+  "engine": {
+    "type": "OnnxRuntime",
+    "config": { "accelerators": ["dml"] }
+  },
+  "passes": {
+    "opt": { "type": "OrtTransformersOptimization", "config": { "optimization_level": "all" } }
+  },
+  "output_dir": "models",
+  "output_name": "models\rnnoise_48k_olive_dml.onnx"
+}

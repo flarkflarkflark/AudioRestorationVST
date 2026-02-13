@@ -132,6 +132,35 @@ void WaveformDisplay::setVerticalZoom (double amplitudeMultiplier)
     repaint();
 }
 
+bool WaveformDisplay::zoomToSelection()
+{
+    if (selectionStart < 0 || selectionEnd < 0 || sampleRate <= 0.0)
+        return false;
+
+    double totalLength = thumbnail.getTotalLength();
+    if (totalLength <= 0.0)
+        return false;
+
+    double selStartTime = selectionStart / sampleRate;
+    double selEndTime = selectionEnd / sampleRate;
+    double selDuration = selEndTime - selStartTime;
+
+    if (selDuration <= 0.0)
+        return false;
+
+    horizontalZoom = totalLength / selDuration;
+    horizontalZoom = juce::jlimit (1.0, 100.0, horizontalZoom);
+
+    double maxScroll = totalLength - (totalLength / horizontalZoom);
+    if (maxScroll > 0.0)
+        scrollPosition = juce::jlimit (0.0, 1.0, selStartTime / maxScroll);
+    else
+        scrollPosition = 0.0;
+
+    repaint();
+    return true;
+}
+
 void WaveformDisplay::paint (juce::Graphics& g)
 {
     auto bounds = getLocalBounds();
@@ -141,10 +170,14 @@ void WaveformDisplay::paint (juce::Graphics& g)
 
     if (thumbnail.getTotalLength() > 0.0)
     {
-        drawWaveform (g, bounds);
-        drawClickMarkers (g, bounds);
-        drawSelection (g, bounds);
-        drawPlaybackCursor (g, bounds);
+        auto rulerBounds = bounds.removeFromTop (timeRulerHeight);
+        drawTimeRuler (g, rulerBounds);
+
+        auto waveformBounds = bounds;
+        drawWaveform (g, waveformBounds);
+        drawClickMarkers (g, waveformBounds);
+        drawSelection (g, waveformBounds);
+        drawPlaybackCursor (g, waveformBounds);
     }
     else if (thumbnail.isFullyLoaded() == false && thumbnail.getNumChannels() > 0)
     {
@@ -176,10 +209,44 @@ void WaveformDisplay::mouseDown (const juce::MouseEvent& event)
     if (thumbnail.getTotalLength() <= 0.0)
         return;
 
+    if (event.position.y <= timeRulerHeight)
+    {
+        double totalLength = thumbnail.getTotalLength();
+        double visibleDuration = totalLength / horizontalZoom;
+        double viewStartTime = scrollPosition * juce::jmax (0.001, totalLength - visibleDuration);
+        double clickTime = viewStartTime + (event.position.x / (double) getWidth()) * visibleDuration;
+        clickTime = juce::jlimit (0.0, totalLength, clickTime);
+        int64_t clickSample = static_cast<int64_t> (clickTime * sampleRate);
+
+        if (event.mods.isRightButtonDown())
+        {
+            selectionEnd = clickSample;
+            if (selectionStart < 0)
+                selectionStart = clickSample;
+        }
+        else
+        {
+            selectionStart = clickSample;
+            if (selectionEnd < 0)
+                selectionEnd = clickSample;
+        }
+
+        if (selectionStart > selectionEnd)
+            std::swap (selectionStart, selectionEnd);
+
+        if (onSelectionChanged && selectionStart >= 0 && selectionEnd >= 0)
+            onSelectionChanged (selectionStart, selectionEnd);
+
+        repaint();
+        return;
+    }
+
     // Store drag start state
     dragStartPosition = event.position;
     isDragging = false;
     isSelectionDrag = false;
+    isHandleDrag = false;
+    activeHandle = HandleDrag::none;
 
     // Calculate click time position
     double totalLength = thumbnail.getTotalLength();
@@ -200,6 +267,30 @@ void WaveformDisplay::mouseDown (const juce::MouseEvent& event)
     // Left-click: Start selection or set playhead
     // Selection starts from click position
     int64_t clickSample = static_cast<int64_t> (clickTime * sampleRate);
+
+    if (event.mods.isLeftButtonDown() && hasSelection())
+    {
+        double startTime = (selectionStart / sampleRate);
+        double endTime = (selectionEnd / sampleRate);
+        double startPosInView = (startTime - viewStartTime) / visibleDuration;
+        double endPosInView = (endTime - viewStartTime) / visibleDuration;
+        float x1 = (float) (startPosInView * getWidth());
+        float x2 = (float) (endPosInView * getWidth());
+        float handleRadius = (float) selectionHandleWidth * 1.5f;
+
+        if (std::abs (event.position.x - x1) <= handleRadius)
+        {
+            isHandleDrag = true;
+            activeHandle = HandleDrag::start;
+            return;
+        }
+        if (std::abs (event.position.x - x2) <= handleRadius)
+        {
+            isHandleDrag = true;
+            activeHandle = HandleDrag::end;
+            return;
+        }
+    }
 
     // If Shift is held and we have an existing selection, extend it
     if (event.mods.isShiftDown() && hasSelection())
@@ -239,6 +330,29 @@ void WaveformDisplay::mouseDrag (const juce::MouseEvent& event)
     double visibleDuration = totalLength / horizontalZoom;
     double viewStartTime = scrollPosition * juce::jmax (0.001, totalLength - visibleDuration);
 
+    // Handle dragging selection handles
+    if (isHandleDrag && activeHandle != HandleDrag::none)
+    {
+        double totalLength = thumbnail.getTotalLength();
+        double visibleDuration = totalLength / horizontalZoom;
+        double viewStartTime = scrollPosition * juce::jmax (0.001, totalLength - visibleDuration);
+        double dragTime = viewStartTime + (event.position.x / (double) getWidth()) * visibleDuration;
+        dragTime = juce::jlimit (0.0, totalLength, dragTime);
+
+        int64_t dragSample = static_cast<int64_t> (dragTime * sampleRate);
+
+        if (activeHandle == HandleDrag::start)
+            selectionStart = dragSample;
+        else if (activeHandle == HandleDrag::end)
+            selectionEnd = dragSample;
+
+        if (selectionStart > selectionEnd)
+            std::swap (selectionStart, selectionEnd);
+
+        repaint();
+        return;
+    }
+
     // Left-click drag: Make/extend selection (standard audio editor behavior)
     if (isSelectionDrag)
     {
@@ -259,6 +373,9 @@ void WaveformDisplay::mouseDrag (const juce::MouseEvent& event)
 
 void WaveformDisplay::mouseUp (const juce::MouseEvent& event)
 {
+    if (event.position.y <= timeRulerHeight && event.mods.isRightButtonDown())
+        return;
+
     // Handle right-click context menu
     if (event.mods.isRightButtonDown())
     {
@@ -297,9 +414,17 @@ void WaveformDisplay::mouseUp (const juce::MouseEvent& event)
         }
     }
 
+    if (isHandleDrag)
+    {
+        if (onSelectionChanged && selectionStart >= 0 && selectionEnd >= 0)
+            onSelectionChanged (selectionStart, selectionEnd);
+    }
+
     // Reset drag state
     isSelectionDrag = false;
     isDragging = false;
+    isHandleDrag = false;
+    activeHandle = HandleDrag::none;
 }
 
 void WaveformDisplay::showContextMenu (const juce::MouseEvent& event)
@@ -439,6 +564,38 @@ void WaveformDisplay::mouseWheelMove (const juce::MouseEvent& event, const juce:
     if (thumbnail.getTotalLength() <= 0.0)
         return;
 
+    if (!event.mods.isCtrlDown() && !event.mods.isCommandDown() && !event.mods.isShiftDown())
+    {
+        if (hasSelection())
+        {
+            int64_t selStart = -1, selEnd = -1;
+            getSelection (selStart, selEnd);
+            if (selStart >= 0 && selEnd > selStart)
+            {
+                double totalLength = thumbnail.getTotalLength();
+                double selectionMidTime = ((selStart + selEnd) * 0.5) / sampleRate;
+                double zoomFactor = wheel.deltaY > 0 ? 1.25 : 0.8;
+                double newZoom = juce::jlimit (1.0, 100.0, horizontalZoom * zoomFactor);
+
+                if (newZoom != horizontalZoom)
+                {
+                    horizontalZoom = newZoom;
+                    double newVisibleDuration = totalLength / horizontalZoom;
+                    double newViewStart = selectionMidTime - 0.5 * newVisibleDuration;
+                    double maxScroll = totalLength - newVisibleDuration;
+
+                    if (maxScroll > 0.0)
+                        scrollPosition = juce::jlimit (0.0, 1.0, newViewStart / maxScroll);
+                    else
+                        scrollPosition = 0.0;
+
+                    repaint();
+                }
+                return;
+            }
+        }
+    }
+
     // Ctrl+wheel: Horizontal zoom (centered on mouse position)
     if (event.mods.isCtrlDown() || event.mods.isCommandDown())
     {
@@ -524,22 +681,98 @@ void WaveformDisplay::drawWaveform (juce::Graphics& g, const juce::Rectangle<int
     thumbnail.drawChannels (g, bounds, startTime, endTime, verticalZoom);
 }
 
+void WaveformDisplay::drawTimeRuler (juce::Graphics& g, const juce::Rectangle<int>& bounds)
+{
+    if (thumbnail.getTotalLength() <= 0.0)
+        return;
+
+    g.setColour (juce::Colour (0xff232323));
+    g.fillRect (bounds);
+
+    double totalLength = thumbnail.getTotalLength();
+    double visibleDuration = totalLength / horizontalZoom;
+    double startTime = scrollPosition * (totalLength - visibleDuration);
+    startTime = juce::jmax (0.0, startTime);
+    double endTime = juce::jmin (totalLength, startTime + visibleDuration);
+
+    const double desiredStep = visibleDuration / 8.0;
+    const double stepOptions[] = {0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0};
+    double step = stepOptions[0];
+    for (double option : stepOptions)
+    {
+        if (option >= desiredStep)
+        {
+            step = option;
+            break;
+        }
+    }
+
+    g.setColour (juce::Colour (0xff8c8c8c));
+    g.setFont (12.0f);
+
+    double firstTick = std::floor (startTime / step) * step;
+    for (double t = firstTick; t <= endTime + step; t += step)
+    {
+        if (t < startTime)
+            continue;
+        double pos = (t - startTime) / visibleDuration;
+        int x = bounds.getX() + (int) (pos * bounds.getWidth());
+        g.drawVerticalLine (x, (float) bounds.getBottom() - 6.0f, (float) bounds.getBottom());
+
+        int minutes = (int) (t / 60.0);
+        double seconds = t - minutes * 60;
+        juce::String label = juce::String::formatted ("%02d:%04.1f", minutes, seconds);
+        g.drawText (label, x + 2, bounds.getY(), 70, bounds.getHeight(), juce::Justification::centredLeft);
+    }
+
+    if (selectionStart >= 0 && selectionEnd >= 0)
+    {
+        double selStartTime = selectionStart / sampleRate;
+        double selEndTime = selectionEnd / sampleRate;
+
+        if (selEndTime >= startTime && selStartTime <= endTime)
+        {
+            g.setColour (juce::Colour (0xff4a90e2));
+            auto drawMarker = [&] (double time, const juce::String& text)
+            {
+                double pos = (time - startTime) / visibleDuration;
+                int x = bounds.getX() + (int) (pos * bounds.getWidth());
+                g.drawVerticalLine (x, (float) bounds.getY(), (float) bounds.getBottom());
+                g.drawText (text, x + 2, bounds.getY(), 70, bounds.getHeight(), juce::Justification::centredLeft);
+            };
+
+            int startMin = (int) (selStartTime / 60.0);
+            double startSec = selStartTime - startMin * 60;
+            int endMin = (int) (selEndTime / 60.0);
+            double endSec = selEndTime - endMin * 60;
+
+            drawMarker (selStartTime, "L " + juce::String::formatted ("%02d:%04.1f", startMin, startSec));
+            drawMarker (selEndTime, "R " + juce::String::formatted ("%02d:%04.1f", endMin, endSec));
+        }
+    }
+}
+
 void WaveformDisplay::drawClickMarkers (juce::Graphics& g, const juce::Rectangle<int>& bounds)
 {
     if (thumbnail.getTotalLength() <= 0.0 || clickMarkers.empty())
         return;
 
     double totalLength = thumbnail.getTotalLength();
+    double visibleDuration = totalLength / horizontalZoom;
+    double startTime = scrollPosition * (totalLength - visibleDuration);
+    startTime = juce::jmax (0.0, startTime);
+    double endTime = juce::jmin (totalLength, startTime + visibleDuration);
 
     g.setColour (juce::Colours::red.withAlpha (0.7f));
 
     for (auto markerSample : clickMarkers)
     {
         double markerTime = markerSample / sampleRate;
-        if (markerTime < 0.0 || markerTime > totalLength)
+        if (markerTime < startTime || markerTime > endTime)
             continue;
 
-        float x = (float) ((markerTime / totalLength) * bounds.getWidth());
+        double posInView = (markerTime - startTime) / visibleDuration;
+        float x = (float) (posInView * bounds.getWidth());
         g.drawVerticalLine ((int) x, (float) bounds.getY(), (float) bounds.getBottom());
 
         // Draw small circle at marker
@@ -549,11 +782,23 @@ void WaveformDisplay::drawClickMarkers (juce::Graphics& g, const juce::Rectangle
 
 void WaveformDisplay::drawPlaybackCursor (juce::Graphics& g, const juce::Rectangle<int>& bounds)
 {
-    if (playbackPosition <= 0.0)
+    if (thumbnail.getTotalLength() <= 0.0)
         return;
 
+    double totalLength = thumbnail.getTotalLength();
+    double visibleDuration = totalLength / horizontalZoom;
+    double startTime = scrollPosition * (totalLength - visibleDuration);
+    startTime = juce::jmax (0.0, startTime);
+    double endTime = juce::jmin (totalLength, startTime + visibleDuration);
+
+    double playheadTime = playbackPosition * totalLength;
+    if (playheadTime < startTime || playheadTime > endTime)
+        return;
+
+    double posInView = (playheadTime - startTime) / visibleDuration;
+    float x = (float) (posInView * bounds.getWidth());
+
     g.setColour (juce::Colours::yellow.withAlpha (0.8f));
-    float x = (float) (playbackPosition * bounds.getWidth());
     g.drawVerticalLine ((int) x, (float) bounds.getY(), (float) bounds.getBottom());
 }
 
@@ -593,4 +838,11 @@ void WaveformDisplay::drawSelection (juce::Graphics& g, const juce::Rectangle<in
 
     g.setColour (juce::Colours::white.withAlpha (0.5f));
     g.drawRect (x1, (float) bounds.getY(), x2 - x1, (float) bounds.getHeight(), 1.0f);
+
+    // Draw draggable handles
+    g.setColour (juce::Colour (0xff4a90e2));
+    float handleHeight = 20.0f;
+    float handleY = bounds.getY() + 4.0f;
+    g.fillRect (x1 - selectionHandleWidth * 0.5f, handleY, (float) selectionHandleWidth, handleHeight);
+    g.fillRect (x2 - selectionHandleWidth * 0.5f, handleY, (float) selectionHandleWidth, handleHeight);
 }

@@ -9,9 +9,13 @@
 #include "../Processors/TrackDetector.h"
 #include "../Utils/AudioFileManager.h"
 #include "../DSP/ClickRemoval.h"
+#include "../DSP/Decrackle.h"
 #include "../DSP/NoiseReduction.h"
 #include "../DSP/FilterBank.h"
+#include "../DSP/OnnxDenoiser.h"
 #include "../Utils/AudioUndoManager.h"
+#include "../Utils/SettingsManager.h"
+#include <array>
 
 /**
  * Standalone Window for Audio Restoration Suite
@@ -40,6 +44,7 @@ public:
     //==============================================================================
     // DocumentWindow overrides
     void closeButtonPressed() override;
+    void requestAppQuit();
 
     //==============================================================================
     // FileDragAndDropTarget overrides
@@ -69,6 +74,7 @@ private:
         fileSave,
         fileSaveAs,
         fileExport,
+        fileRecord,
         fileClose,
         fileRecentClear,
         fileExit,
@@ -80,6 +86,7 @@ private:
 
         processDetectClicks,
         processRemoveClicks,
+        processDecrackle,
         processNoiseReduction,
         processCutAndSplice,
         processGraphicEQ,
@@ -104,6 +111,8 @@ private:
         transportStop,
 
         optionsAudioSettings,
+        optionsProcessingSettings,
+        optionsAIDenoise,
 
         helpAbout,
         helpDocumentation,
@@ -144,10 +153,27 @@ private:
     juce::AudioSourcePlayer audioSourcePlayer;
     std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
     juce::AudioTransportSource transportSource;
+    class AudioRecorder;
+    std::unique_ptr<AudioRecorder> recorder;
     bool isPlaying = false;
+    bool isRecording = false;
+    juce::MemoryBlock bufferedRecording;
+    float meterLevelLeft = 0.0f;
+    float meterLevelRight = 0.0f;
+    bool showCorrectionList = true;
+    bool quitAfterExport = false;
+    juce::TooltipWindow tooltipWindow {this, 500};
+    bool aiDenoiseEnabled = false;
 
     void showAudioSettings();
+    void showProcessingSettings();
     void setUIScale (float newScale);
+    void applyDenoiserSettings();
+    void toggleRecording();
+    void startRecording();
+    void stopRecording();
+    void setRecordingState (bool recording);
+    void loadRecordingFromMemory (juce::MemoryBlock&& data);
 
     //==============================================================================
     // UI Scale
@@ -162,12 +188,22 @@ private:
     //==============================================================================
     // DSP Processors for audio restoration
     ClickRemoval clickRemovalProcessor;
+    Decrackle decrackleProcessor;
     NoiseReduction noiseReductionProcessor;
     FilterBank filterBankProcessor;
+    TrackDetector trackDetector;
+    class DenoiseAudioSource;
+    std::unique_ptr<DenoiseAudioSource> denoiseSource;
+    OnnxDenoiser realtimeDenoiser;
 
     //==============================================================================
     // Undo/Redo management
     AudioUndoManager undoManager;
+
+    //==============================================================================
+    // Batch processing state
+    std::unique_ptr<BatchProcessor> activeBatchProcessor;
+    juce::File lastBatchOutputDirectory;
 
     //==============================================================================
     // File loading state (for progress dialog)
@@ -180,6 +216,7 @@ private:
     float clickSensitivity = 60.0f;      // 0-100, higher = more sensitive
     int clickMaxWidth = 500;              // Max samples to correct
     int clickRemovalMethod = 2;           // 0=Spline, 1=Crossfade, 2=Automatic
+    std::array<float, 10> lastEqGains {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
 
     //==============================================================================
     // Helper methods
@@ -187,13 +224,21 @@ private:
     void openFileWithProgress (const juce::File& file);
     void finishFileLoad (const juce::File& file);
     void closeFile();
-    void saveFile (const juce::File& file);
+    bool saveFile (const juce::File& file);
     void exportFile();
+    bool promptToSaveIfNeeded (const juce::String& actionName);
+    bool saveCurrentSessionForPrompt();
     void detectClicks();
     void performClickDetection();  // Called after settings dialog
     void removeClicks();
+    void applyDecrackle();
     void applyNoiseReduction();
-    void applyNoiseReductionWithSettings (float reductionDB, float profileStartSec, float profileLengthSec);
+    void applyNoiseReductionWithSettings (float reductionDB,
+                                          float profileStartSec,
+                                          float profileLengthSec,
+                                          float adaptiveRate,
+                                          int processStartSample,
+                                          int processEndSample);
     void detectTracks();
     void splitTracks();
     void showBatchProcessor();
@@ -201,6 +246,13 @@ private:
     void showAboutDialog();
     void updateTitle();
     void loadSession (const juce::File& sessionFile);
+    bool fetchDiscogsMetadata (const juce::String& discogsUrl,
+                               const juce::String& token,
+                               juce::String& albumTitle,
+                               juce::String& artistName,
+                               juce::String& year,
+                               juce::StringArray& trackNames,
+                               juce::String& errorMessage);
 
     // Additional Process menu methods
     void cutAndSplice();
@@ -214,6 +266,16 @@ private:
 
     // View menu methods
     void showSpectrogram();
+
+    struct ProcessingRange
+    {
+        int start = 0;
+        int end = 0;
+        bool hasSelection = false;
+        juce::String rangeInfo = "whole file";
+    };
+
+    ProcessingRange getProcessingRange() const;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StandaloneWindow)
 };
@@ -241,15 +303,24 @@ public:
     // Keyboard handling for spacebar play/pause
     bool keyPressed (const juce::KeyPress& key) override;
 
+    void zoomIn();
+    void zoomOut();
+    void zoomFit();
+
     // Access to parent window for transport control
     void setParentWindow (StandaloneWindow* parent) { parentWindow = parent; }
 
     // Access to components
     WaveformDisplay& getWaveformDisplay() { return waveformDisplay; }
     CorrectionListView& getCorrectionListView() { return correctionListView; }
+    bool isLoopSelectionEnabled() const { return loopSelectionButton.getToggleState(); }
 
     void setAudioBuffer (const juce::AudioBuffer<float>* buffer, double sampleRate);
     void updatePlaybackPosition (double position);
+    void setMeterLevel (float leftLevel, float rightLevel);
+    void setCorrectionListVisible (bool visible);
+    void setRecording (bool recording);
+    void setTransportTime (double seconds);
 
 private:
     StandaloneWindow* parentWindow = nullptr;
@@ -260,13 +331,93 @@ private:
     juce::TextButton rewindButton {"<<"};
     juce::TextButton playPauseButton {"Play"};  // Toggle between Play and Pause
     juce::TextButton stopButton {"Stop"};
+    juce::TextButton recordButton {"Rec"};
     juce::TextButton forwardButton {">>"};
+    juce::ToggleButton loopSelectionButton {"Loop Sel"};
+    juce::TextButton zoomToSelectionButton {"Zoom Sel"};
     juce::Slider positionSlider;
     juce::Label timeLabel;
 
     // Volume control
     juce::Slider volumeSlider;
     juce::Label volumeLabel;
+    class LedMeter : public juce::Component
+    {
+    public:
+        void setLevels (float leftLevel, float rightLevel)
+        {
+            left = juce::jlimit (0.0f, 1.0f, leftLevel);
+            right = juce::jlimit (0.0f, 1.0f, rightLevel);
+            repaint();
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto bounds = getLocalBounds();
+            g.fillAll (juce::Colour (0xff1b1b1b));
+
+            const int segments = 12;
+            const int gap = 2;
+            int segmentHeight = (bounds.getHeight() - (segments - 1) * gap) / segments;
+            int litLeft = juce::roundToInt (left * segments);
+            int litRight = juce::roundToInt (right * segments);
+            int meterGap = 2;
+            int columnWidth = (bounds.getWidth() - meterGap) / 2;
+            auto leftBounds = bounds.withWidth (columnWidth);
+            auto rightBounds = bounds.withX (bounds.getX() + columnWidth + meterGap)
+                                   .withWidth (bounds.getWidth() - columnWidth - meterGap);
+
+            for (int i = 0; i < segments; ++i)
+            {
+                int y = bounds.getBottom() - (i + 1) * segmentHeight - i * gap;
+                juce::Rectangle<int> leftSegment (leftBounds.getX(), y, leftBounds.getWidth(), segmentHeight);
+                juce::Rectangle<int> rightSegment (rightBounds.getX(), y, rightBounds.getWidth(), segmentHeight);
+
+                bool litL = i < litLeft;
+                bool litR = i < litRight;
+
+                if (litL)
+                {
+                    if (i > 9)
+                        g.setColour (juce::Colours::red);
+                    else if (i > 7)
+                        g.setColour (juce::Colours::orange);
+                    else
+                        g.setColour (juce::Colours::green);
+                }
+                else
+                {
+                    g.setColour (juce::Colour (0xff2a2a2a));
+                }
+
+                g.fillRect (leftSegment);
+
+                if (litR)
+                {
+                    if (i > 9)
+                        g.setColour (juce::Colours::red);
+                    else if (i > 7)
+                        g.setColour (juce::Colours::orange);
+                    else
+                        g.setColour (juce::Colours::green);
+                }
+                else
+                {
+                    g.setColour (juce::Colour (0xff2a2a2a));
+                }
+
+                g.fillRect (rightSegment);
+            }
+
+            g.setColour (juce::Colour (0xff3a3a3a));
+            g.drawRect (bounds, 1);
+        }
+
+    private:
+        float left = 0.0f;
+        float right = 0.0f;
+    };
+    LedMeter volumeMeter;
 
     // Zoom controls
     juce::TextButton zoomInButton {"+"};
@@ -351,6 +502,9 @@ private:
 
     const juce::AudioBuffer<float>* currentBuffer = nullptr;
     double currentSampleRate = 44100.0;
+    bool correctionListVisible = true;
+
+    bool seekToSelectionStart();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };
@@ -362,8 +516,10 @@ private:
 class StandaloneWindow::ScaledContentWrapper : public juce::Component
 {
 public:
-    ScaledContentWrapper (MainComponent* content, int /*baseW*/, int /*baseH*/)
-        : contentComponent (content)
+    ScaledContentWrapper (MainComponent* content, int baseW, int baseH)
+        : contentComponent (content),
+          baseWidth (baseW),
+          baseHeight (baseH)
     {
         addAndMakeVisible (content);
     }
@@ -371,7 +527,6 @@ public:
     void setScaleFactor (float newScale)
     {
         scaleFactor = newScale;
-        // For now, ignore scale factor - use responsive layout instead
         resized();
     }
 
@@ -379,11 +534,21 @@ public:
 
     void resized() override
     {
-        // Make content fill the entire wrapper - responsive layout
         if (contentComponent != nullptr)
         {
-            contentComponent->setTransform (juce::AffineTransform()); // Clear any transform
-            contentComponent->setBounds (getLocalBounds());
+            float scaleX = (baseWidth > 0) ? (getWidth() / (float) baseWidth) : 1.0f;
+            float scaleY = (baseHeight > 0) ? (getHeight() / (float) baseHeight) : 1.0f;
+            float scale = juce::jmax (0.1f, juce::jmin (scaleX, scaleY));
+
+            int scaledWidth = juce::roundToInt (baseWidth * scale);
+            int scaledHeight = juce::roundToInt (baseHeight * scale);
+            int offsetX = (getWidth() - scaledWidth) / 2;
+            int offsetY = (getHeight() - scaledHeight) / 2;
+
+            contentComponent->setBounds (0, 0, baseWidth, baseHeight);
+            contentComponent->setTransform (juce::AffineTransform::scale (scale)
+                                                .translated ((float) offsetX / scale,
+                                                             (float) offsetY / scale));
         }
     }
 
@@ -395,6 +560,8 @@ public:
 private:
     MainComponent* contentComponent;
     float scaleFactor = 1.0f;
+    int baseWidth = 0;
+    int baseHeight = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScaledContentWrapper)
 };

@@ -17,6 +17,13 @@
    cmake --build . --config Release
    ```
 
+3. **Optional: MP3 support (vcpkg)**
+   ```bash
+   set VCPKG_ROOT=C:\path\to\vcpkg
+   powershell -ExecutionPolicy Bypass -File tools\install_vcpkg_mp3.ps1
+   cmake .. -DVRS_USE_VCPKG=ON -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+   ```
+
 3. **Test the Plugin**
    - **VST3**: Copy from `build/AudioRestoration_artefacts/Release/VST3/` to your VST3 folder
    - **Standalone**: Run `build/AudioRestoration_artefacts/Release/Standalone/Audio Restoration`

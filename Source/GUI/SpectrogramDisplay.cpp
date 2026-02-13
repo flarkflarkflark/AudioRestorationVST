@@ -32,9 +32,17 @@ void SpectrogramDisplay::paint (juce::Graphics& g)
     g.fillAll (juce::Colour (0xff1a1a2e));
 
     // Calculate spectrogram area
-    auto spectrogramArea = bounds.reduced (leftMargin, topMargin)
+    juce::Rectangle<int> spectrogramArea = bounds;
+    if (showAxes)
+    {
+        spectrogramArea = bounds.reduced (leftMargin, topMargin)
                                   .withTrimmedRight (rightMargin)
                                   .withTrimmedBottom (bottomMargin);
+    }
+    else
+    {
+        spectrogramArea = bounds.reduced (4);
+    }
 
     if (imageReady.load() && spectrogramImage.isValid())
     {
@@ -73,9 +81,12 @@ void SpectrogramDisplay::paint (juce::Graphics& g)
     g.drawRect (spectrogramArea);
 
     // Draw axes
-    drawFrequencyAxis (g, bounds);
-    drawTimeAxis (g, bounds);
-    drawDbScale (g, bounds);
+    if (showAxes)
+    {
+        drawFrequencyAxis (g, bounds);
+        drawTimeAxis (g, bounds);
+        drawDbScale (g, bounds);
+    }
 }
 
 void SpectrogramDisplay::resized()
@@ -151,6 +162,17 @@ void SpectrogramDisplay::setFftSize (int newSize)
     }
 }
 
+void SpectrogramDisplay::setShowAxes (bool shouldShowAxes)
+{
+    if (showAxes != shouldShowAxes)
+    {
+        showAxes = shouldShowAxes;
+        if (audioData.getNumSamples() > 0 && !analyzing.load())
+            generateSpectrogram();
+        repaint();
+    }
+}
+
 void SpectrogramDisplay::generateSpectrogram()
 {
     if (audioData.getNumSamples() == 0)
@@ -160,8 +182,18 @@ void SpectrogramDisplay::generateSpectrogram()
 
     // Calculate image dimensions
     auto bounds = getLocalBounds();
-    int imageWidth = bounds.getWidth() - leftMargin - rightMargin;
-    int imageHeight = bounds.getHeight() - topMargin - bottomMargin;
+    int imageWidth = bounds.getWidth();
+    int imageHeight = bounds.getHeight();
+    if (showAxes)
+    {
+        imageWidth -= (leftMargin + rightMargin);
+        imageHeight -= (topMargin + bottomMargin);
+    }
+    else
+    {
+        imageWidth -= 8;
+        imageHeight -= 8;
+    }
 
     if (imageWidth < 10 || imageHeight < 10)
         return;
