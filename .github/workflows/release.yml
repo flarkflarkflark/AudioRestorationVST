@@ -69,7 +69,7 @@ jobs:
         run: |
           cd build
           ARTEFACTS=$(ls -d *_artefacts 2>/dev/null | head -1)
-          if [ -z "$ARTEFACTS\" ]; then
+          if [ -z "$ARTEFACTS" ]; then
             echo "No *_artefacts directory found"
             exit 1
           fi
@@ -83,7 +83,7 @@ jobs:
           # Zoek .vst3
           PLUGIN=$(find . -type f -name "*.vst3" | head -1)
           # Zoek standalone: .app op macOS, executable op Linux
-          STANDALONE=$(find . -type f \( -name "*.exe" -o -name "*.app" -o -perm -u+x \) | head -1)
+          STANDALONE=$(find . -type f \( -name "*.app" -o -perm -u+x \) | head -1)
 
           echo "Found plugin: $PLUGIN"
           echo "Found standalone: $STANDALONE"
