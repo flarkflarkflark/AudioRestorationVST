@@ -48,7 +48,7 @@ public:
     juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
     void getAllCommands (juce::Array<juce::CommandID>& commands) override;
     void getCommandInfo (juce::CommandID commandID, juce::ApplicationCommandInfo& result) override;
-    bool perform (const juce::InvocationInfo& info) override;
+    bool perform (const juce::ApplicationCommandTarget::InvocationInfo& info) override;
 
     //==============================================================================
     // DocumentWindow overrides
@@ -149,8 +149,8 @@ private:
 
     // Window tracking for toggles
     struct SpectrogramWindow;
-    juce::ComponentSafePointer<juce::Component> spectrogramWindow;
-    juce::ComponentSafePointer<juce::Component> audioSettingsWindow;
+    juce::Component::SafePointer<juce::Component> spectrogramWindow;
+    juce::Component::SafePointer<juce::Component> audioSettingsWindow;
     bool isSettingsVisible = false;
 
     //==============================================================================

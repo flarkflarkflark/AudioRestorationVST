@@ -621,7 +621,6 @@ StandaloneWindow::StandaloneWindow()
     // Initialize command manager
     commandManager.registerAllCommandsForTarget (this);
     addKeyListener (commandManager.getKeyMappings());
-    menuBar.setApplicationCommandManagerToWatch (&commandManager);
 
     // Initialize audio device
     juce::String audioError = audioDeviceManager.initialise (
@@ -1483,10 +1482,10 @@ bool StandaloneWindow::saveFile (const juce::File& file)
     dataObj->setProperty ("clickRemovalMethod", clickRemovalMethod);
     sessionData = juce::var(dataObj.get());
 
+    // If we have recorded audio but no source file, we MUST save the audio first
     if (!currentFile.existsAsFile() && audioBuffer.getNumSamples() > 0)
     {
-        // Recorded audio but no source file - must save audio first
-        juce::AlertWindow::showMessageBox (juce::AlertWindow::QuestionIcon,
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::QuestionIcon,
                                            "Save Audio First",
                                            "Please save the recorded audio to a file first.",
                                            "OK");
@@ -1698,7 +1697,7 @@ void StandaloneWindow::getCommandInfo (juce::CommandID commandID, juce::Applicat
     }
 }
 
-bool StandaloneWindow::perform (const juce::InvocationInfo& info)
+bool StandaloneWindow::perform (const juce::ApplicationCommandTarget::InvocationInfo& info)
 {
     if (info.commandID == transportPlay || info.commandID == transportPause)
     {
@@ -3086,7 +3085,7 @@ void StandaloneWindow::showAboutDialog()
 
             // Version at bottom of label - smaller
             g.setFont (juce::Font (juce::FontOptions (16.0f)));
-            g.drawText ("Version 1.6.20",
+            g.drawText ("Version 1.6.21",
                        centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.62f,
                        labelRadius * 1.8f, 24.0f,
                        juce::Justification::centred);
@@ -6164,14 +6163,14 @@ bool StandaloneWindow::MainComponent::keyPressed (const juce::KeyPress& key)
     if (key == juce::KeyPress::spaceKey)
     {
         if (parentWindow)
-            parentWindow->perform (juce::InvocationInfo (StandaloneWindow::transportPlay));
+            parentWindow->perform (juce::ApplicationCommandTarget::InvocationInfo (StandaloneWindow::transportPlay));
         return true;
     }
     
     if (key == juce::KeyPress::escapeKey)
     {
         if (parentWindow)
-            parentWindow->perform (juce::InvocationInfo (StandaloneWindow::transportStop));
+            parentWindow->perform (juce::ApplicationCommandTarget::InvocationInfo (StandaloneWindow::transportStop));
         return true;
     }
 
