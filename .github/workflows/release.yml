@@ -101,8 +101,19 @@ jobs:
             
             cp -R "$STANDALONE" "release-files/$DEST_NAME"
             
+            # For Linux, also copy libonnxruntime.so and fix rpath
+            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+              ONNX_LIB=$(find build -name "libonnxruntime.so*" | head -1)
+              if [ -n "$ONNX_LIB" ]; then
+                cp "$ONNX_LIB" "release-files/"
+                # Set rpath so it looks for the .so in the same directory as the executable
+                sudo apt-get install -y patchelf
+                patchelf --set-rpath '$ORIGIN' "release-files/$DEST_NAME"
+              fi
+            fi
+            
             cd release-files
-            zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$DEST_NAME"
+            zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$DEST_NAME" $([[ "${{ matrix.os }}" == "ubuntu-latest" ]] && echo "libonnxruntime.so*")
             cd ..
           fi
 
