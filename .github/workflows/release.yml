@@ -85,12 +85,14 @@ jobs:
             local lib_pattern="$3"
             
             if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-              # Use -L to follow symlinks and copy the actual file
-              local lib_src=$(find build -name "$lib_pattern" | head -1)
-              if [ -n "$lib_src" ]; then
-                cp -L "$lib_src" "$(dirname "$binary")/"
-                # Also copy any versioned variants if they exist
-                cp -L $(dirname "$lib_src")/$lib_pattern "$(dirname "$binary")/" 2>/dev/null || true
+              # Find the directory containing the actual libraries (not just the ones copied by JUCE)
+              local lib_dir=$(find build -name "$lib_name" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
+              if [ -n "$lib_dir" ]; then
+                echo "Found library directory: $lib_dir"
+                # Copy ALL files matching the pattern (preserving symlinks or copying all variants)
+                cp -P "$lib_dir"/$lib_pattern "$(dirname "$binary")/"
+                # Also ensure the actual binary version is followed if we use -L elsewhere
+                # Here we just copy everything so the exact filename requested exists
                 patchelf --set-rpath '$ORIGIN' "$binary"
               fi
             elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
@@ -111,7 +113,7 @@ jobs:
             cp -R "$PLUGIN" "$DEST"
             INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -perm +111 \) ! -name "*.dylib" | head -1)
             if [ -n "$INNER_BIN" ]; then
-              fix_deps "$INNER_BIN" "libonnxruntime.dylib" "libonnxruntime.so*"
+              fix_deps "$INNER_BIN" "libonnxruntime.so" "libonnxruntime.so*"
             fi
             cd release-files && zip -r "AudioRestoration-${{ matrix.artifact_name }}-VST3.zip" "$(basename "$DEST")" && cd ..
           fi
@@ -123,15 +125,17 @@ jobs:
                DEST_PATH="release-files/$DEST_NAME.app"
                cp -R "$STANDALONE" "$DEST_PATH"
                INNER_BIN=$(find "$DEST_PATH" -type f -perm +111 ! -name "*.dylib" | head -1)
-               fix_deps "$INNER_BIN" "libonnxruntime.dylib" "libonnxruntime.so*"
+               fix_deps "$INNER_BIN" "libonnxruntime.so" "libonnxruntime.so*"
             else
                DEST_PATH="release-files/$DEST_NAME"
                cp "$STANDALONE" "$DEST_PATH"
-               fix_deps "$DEST_PATH" "libonnxruntime.dylib" "libonnxruntime.so*"
+               # For Linux standalone, copy libs to same folder as binary
+               fix_deps "$DEST_PATH" "libonnxruntime.so" "libonnxruntime.so*"
             fi
-            # Ensure we include the .so files in the root of the ZIP for Linux standalone
+            
             cd release-files
             if [[ "${{ matrix.os }}" == "ubuntu-latest" && "$STANDALONE" != *.app ]]; then
+               # Include all variants in the zip root for Linux standalone
                zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so*
             else
                zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$(basename "$DEST_PATH")"
