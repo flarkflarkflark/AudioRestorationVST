@@ -60,13 +60,17 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-VST3
-        path: build/VinylRestorationSuite_artefacts/Release/VST3/
+        path: build/**/VST3/
+        if-no-files-found: error
 
     - name: Upload Standalone (Linux)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-Standalone
-        path: build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
+        path: |
+          build/**/Standalone/
+          build/**/VinylRestorationSuite
+        if-no-files-found: error
 
   build-macos:
     name: Build on macOS
@@ -96,19 +100,15 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-macOS-VST3
-        path: |
-          build/VinylRestorationSuite_artefacts/VST3/
-          build/VinylRestorationSuite_artefacts/Release/VST3/
-        if-no-files-found: warn
+        path: build/**/*.vst3/
+        if-no-files-found: error
 
     - name: Upload Standalone (macOS)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-macOS-Standalone
-        path: |
-          build/VinylRestorationSuiteStandalone_artefacts/Standalone/
-          build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
-        if-no-files-found: warn
+        path: build/**/*.app/
+        if-no-files-found: error
 
   build-windows:
     name: Build on Windows
@@ -138,10 +138,12 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Windows-VST3
-        path: build/VinylRestorationSuite_artefacts/Release/VST3/
+        path: build/**/*.vst3/
+        if-no-files-found: error
 
     - name: Upload Standalone (Windows)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Windows-Standalone
-        path: build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
+        path: build/**/*.exe
+        if-no-files-found: error

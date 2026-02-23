@@ -72,9 +72,14 @@ jobs:
           echo "=== Searching for VST3 and Standalone ==="
           # Find VST3 (file on Linux, directory on macOS)
           PLUGIN=$(find build -name "*.vst3" | head -1)
-          # Standalone: .app for macOS (dir), executable for Linux (file)
-          # Exclude common build tool binaries and libraries
-          STANDALONE=$(find build -type d -name "*.app" -o -type f -perm -u+x ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" ! -name "cpack*" ! -name "*.vst3" ! -name "ctest*" ! -name "JUCE*" | grep -i "VinylRestorationSuite" | head -1)
+          
+          # Standalone macOS: .app directory
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            STANDALONE=$(find build -type d -name "*.app" | head -1)
+          else
+            # Standalone Linux: executable file
+            STANDALONE=$(find build -type f -perm -u+x ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" ! -name "cpack*" ! -name "*.vst3" ! -name "ctest*" ! -name "JUCE*" | grep -i "VinylRestorationSuite" | head -1)
+          fi
 
           echo "Found plugin: $PLUGIN"
           echo "Found standalone: $STANDALONE"
@@ -119,7 +124,7 @@ jobs:
           
           Write-Host "=== Searching for VST3 and Standalone ==="
           $plugin = Get-ChildItem -Recurse build -Include *.vst3 | Select-Object -First 1
-          $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { $_.Name -like "*VinylRestorationSuite*" -and $_.Name -notlike "*cmake*" } | Select-Object -First 1
+          $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { $_.Name -like "*VinylRestorationSuite*" -and $_.Name -notlike "*cmake*" -and $_.Name -notlike "*vst3*" } | Select-Object -First 1
 
           Write-Host "Found plugin: $($plugin.FullName)"
           Write-Host "Found standalone: $($standalone.FullName)"
