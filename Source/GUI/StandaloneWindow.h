@@ -36,11 +36,19 @@ class StandaloneWindow : public juce::DocumentWindow,
                          public juce::FileDragAndDropTarget,
                          public juce::MenuBarModel,
                          public juce::Timer,
-                         public juce::ChangeListener
+                         public juce::ChangeListener,
+                         public juce::ApplicationCommandTarget
 {
 public:
     StandaloneWindow();
     ~StandaloneWindow() override;
+
+    //==============================================================================
+    // ApplicationCommandTarget overrides
+    juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
+    void getAllCommands (juce::Array<juce::CommandID>& commands) override;
+    void getCommandInfo (juce::CommandID commandID, juce::ApplicationCommandInfo& result) override;
+    bool perform (const juce::InvocationInfo& info) override;
 
     //==============================================================================
     // DocumentWindow overrides
@@ -137,6 +145,13 @@ private:
 
     ReaperLookAndFeel reaperLookAndFeel;
     juce::MenuBarComponent menuBar;
+    juce::ApplicationCommandManager commandManager;
+
+    // Window tracking for toggles
+    struct SpectrogramWindow;
+    juce::ComponentSafePointer<juce::Component> spectrogramWindow;
+    juce::ComponentSafePointer<juce::Component> audioSettingsWindow;
+    bool isSettingsVisible = false;
 
     //==============================================================================
     // Audio file management
@@ -316,6 +331,12 @@ public:
     WaveformDisplay& getWaveformDisplay() { return waveformDisplay; }
     CorrectionListView& getCorrectionListView() { return correctionListView; }
     bool isLoopSelectionEnabled() const { return loopSelectionButton.getToggleState(); }
+    
+    juce::Button& getToolbarSpectrumButton() { return toolbarSpectrumButton; }
+    juce::Button& getToolbarSettingsButton() { return toolbarSettingsButton; }
+    juce::Button& getMonitorButton() { return monitorButton; }
+    juce::Button& getPlayPauseButton() { return playPauseButton; }
+    juce::Button& getStopButton() { return stopButton; }
 
     void setAudioBuffer (const juce::AudioBuffer<float>* buffer, double sampleRate);
     void updatePlaybackPosition (double position);

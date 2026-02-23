@@ -76,7 +76,7 @@ public:
             g.setColour (slider.findColour (juce::Slider::backgroundColourId));
             g.fillRoundedRectangle (track, 2.0f);
             
-            g.setColour (slider.findColour (juce::Slider::outlineColourId));
+            g.setColour (slider.findColour (juce::Slider::trackColourId).darker());
             g.drawRoundedRectangle (track, 2.0f, 1.0f);
 
             // Thumb

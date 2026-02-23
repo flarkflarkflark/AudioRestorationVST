@@ -618,6 +618,11 @@ StandaloneWindow::StandaloneWindow()
     setUsingNativeTitleBar (true);
     setResizable (true, true);
 
+    // Initialize command manager
+    commandManager.registerAllCommandsForTarget (this);
+    addKeyListener (commandManager.getKeyMappings());
+    menuBar.setApplicationCommandManagerToWatch (&commandManager);
+
     // Initialize audio device
     juce::String audioError = audioDeviceManager.initialise (
         2,     // number of input channels
@@ -819,14 +824,14 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
 
     if (topLevelMenuIndex == 0) // File
     {
-        menu.addItem (fileOpen, "Open...                   Ctrl+O");
-        menu.addItem (fileClose, "Close File                Ctrl+W", currentFile.exists());
+        menu.addCommandItem (&commandManager, fileOpen);
+        menu.addCommandItem (&commandManager, fileClose);
         menu.addSeparator();
-        menu.addItem (fileSave, "Save                      Ctrl+S", currentFile.exists());
-        menu.addItem (fileSaveAs, "Save As...             Ctrl+Shift+S");
+        menu.addCommandItem (&commandManager, fileSave);
+        menu.addCommandItem (&commandManager, fileSaveAs);
         menu.addSeparator();
-        menu.addItem (fileExport, "Export Audio...           Ctrl+E", audioBuffer.getNumSamples() > 0);
-        menu.addItem (fileRecord, isRecording ? "Stop Recording" : "Record Audio...           Ctrl+R");
+        menu.addCommandItem (&commandManager, fileExport);
+        menu.addCommandItem (&commandManager, fileRecord);
         menu.addSeparator();
 
         // Recent files submenu
@@ -836,22 +841,15 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
         menu.addItem (fileRecentClear, "Clear Recent Files");
 
         menu.addSeparator();
-        menu.addItem (fileExit, "Exit                      Ctrl+Q");
+        menu.addCommandItem (&commandManager, fileExit);
     }
     else if (topLevelMenuIndex == 1) // Edit
     {
-        bool hasAudio = audioBuffer.getNumSamples() > 0;
-        juce::String undoText = "Undo";
-        juce::String redoText = "Redo";
-        if (undoManager.canUndo())
-            undoText = "Undo " + undoManager.getUndoDescription();
-        if (undoManager.canRedo())
-            redoText = "Redo " + undoManager.getRedoDescription();
-        menu.addItem (editUndo, undoText + "                      Ctrl+Z", undoManager.canUndo());
-        menu.addItem (editRedo, redoText + "                      Ctrl+Y", undoManager.canRedo());
+        menu.addCommandItem (&commandManager, editUndo);
+        menu.addCommandItem (&commandManager, editRedo);
         menu.addSeparator();
-        menu.addItem (editSelectAll, "Select All                Ctrl+A", hasAudio);
-        menu.addItem (editDeselect, "Deselect                  Ctrl+D", hasAudio);
+        menu.addCommandItem (&commandManager, editSelectAll);
+        menu.addCommandItem (&commandManager, editDeselect);
     }
     else if (topLevelMenuIndex == 2) // Process
     {
@@ -882,9 +880,9 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
     }
     else if (topLevelMenuIndex == 3) // View
     {
-        menu.addItem (viewZoomIn, "Zoom In                   Ctrl++");
-        menu.addItem (viewZoomOut, "Zoom Out                  Ctrl+-");
-        menu.addItem (viewZoomFit, "Zoom to Fit               Ctrl+0");
+        menu.addCommandItem (&commandManager, viewZoomIn);
+        menu.addCommandItem (&commandManager, viewZoomOut);
+        menu.addCommandItem (&commandManager, viewZoomFit);
         menu.addSeparator();
 
         // UI Scale submenu
@@ -902,7 +900,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
 
         menu.addSeparator();
         menu.addItem (viewShowCorrectionList, "Show Correction List", true, showCorrectionList);
-        menu.addItem (viewShowSpectrogram, "Show Spectrogram...      Ctrl+G", audioBuffer.getNumSamples() > 0);
+        menu.addCommandItem (&commandManager, viewShowSpectrogram);
     }
     else if (topLevelMenuIndex == 4) // Options
     {
@@ -1178,6 +1176,13 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
 
 void StandaloneWindow::timerCallback()
 {
+    if (mainComponent != nullptr)
+    {
+        mainComponent->getToolbarSpectrumButton().setToggleState (spectrogramWindow != nullptr, juce::dontSendNotification);
+        mainComponent->getToolbarSettingsButton().setToggleState (audioSettingsWindow != nullptr, juce::dontSendNotification);
+        mainComponent->getMonitorButton().setToggleState (monitoringEnabled, juce::dontSendNotification);
+    }
+
     if (isRecording && recorder != nullptr && recorder->isRecording())
     {
         meterLevelLeft = recorder->getMeterLevel (0);
@@ -1471,7 +1476,23 @@ bool StandaloneWindow::saveFile (const juce::File& file)
 
     // Save session (corrections, settings, etc.)
     juce::var sessionData;
-    // TODO: Build session data from current state
+    // Build session data
+    juce::DynamicObject::Ptr dataObj = new juce::DynamicObject();
+    dataObj->setProperty ("clickSensitivity", clickSensitivity);
+    dataObj->setProperty ("clickMaxWidth", clickMaxWidth);
+    dataObj->setProperty ("clickRemovalMethod", clickRemovalMethod);
+    sessionData = juce::var(dataObj.get());
+
+    if (!currentFile.existsAsFile() && audioBuffer.getNumSamples() > 0)
+    {
+        // Recorded audio but no source file - must save audio first
+        juce::AlertWindow::showMessageBox (juce::AlertWindow::QuestionIcon,
+                                           "Save Audio First",
+                                           "Please save the recorded audio to a file first.",
+                                           "OK");
+        exportFile();
+        return false;
+    }
 
     if (fileManager.saveSession (sessionFile, currentFile, sessionData))
     {
@@ -1506,16 +1527,16 @@ bool StandaloneWindow::promptToSaveIfNeeded (const juce::String& actionName)
         "Unsaved Changes",
         "Do you want to save your changes before " + actionName + "?",
         "Save", "Don't Save", "Cancel",
-        nullptr, nullptr
+        this, nullptr
     );
-
-    if (result == 0) // Cancel
-        return false;
 
     if (result == 1) // Save
         return saveCurrentSessionForPrompt();
 
-    return true; // Don't Save
+    if (result == 2) // Don't Save
+        return true;
+
+    return false; // Cancel (result == 3 or result == 0)
 }
 
 bool StandaloneWindow::saveCurrentSessionForPrompt()
@@ -1569,6 +1590,132 @@ void StandaloneWindow::exportFile()
                 quitAfterExport = false;
             }
         });
+}
+
+void StandaloneWindow::getAllCommands (juce::Array<juce::CommandID>& commands)
+{
+    const juce::CommandID ids[] = { fileOpen, fileSave, fileSaveAs, fileExport, fileRecord, fileExit,
+                                    editUndo, editRedo, editSelectAll, editDeselect,
+                                    viewZoomIn, viewZoomOut, viewZoomFit, viewShowSpectrogram,
+                                    transportPlay, transportPause, transportStop,
+                                    optionsAudioSettings };
+    commands.addArray (ids, juce::numElementsInArray (ids));
+}
+
+void StandaloneWindow::getCommandInfo (juce::CommandID commandID, juce::ApplicationCommandInfo& result)
+{
+    const bool hasAudio = audioBuffer.getNumSamples() > 0;
+    const bool hasFile = currentFile.exists();
+
+    switch (commandID)
+    {
+        case fileOpen:
+            result.setInfo ("Open...", "Opens an audio file or session", "File", 0);
+            result.addDefaultKeypress ('o', juce::ModifierKeys::commandModifier);
+            break;
+        case fileClose:
+            result.setInfo ("Close File", "Closes the current file", "File", 0);
+            result.setActive (hasFile);
+            result.addDefaultKeypress ('w', juce::ModifierKeys::commandModifier);
+            break;
+        case fileSave:
+            result.setInfo ("Save", "Saves the current session", "File", 0);
+            result.setActive (hasFile);
+            result.addDefaultKeypress ('s', juce::ModifierKeys::commandModifier);
+            break;
+        case fileSaveAs:
+            result.setInfo ("Save As...", "Saves the current session with a new name", "File", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress ('s', juce::ModifierKeys::commandModifier | juce::ModifierKeys::shiftModifier);
+            break;
+        case fileExport:
+            result.setInfo ("Export Audio...", "Exports the audio to a file", "File", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress ('e', juce::ModifierKeys::commandModifier);
+            break;
+        case fileRecord:
+            result.setInfo (isRecording ? "Stop Recording" : "Record Audio...", "Starts or stops recording", "File", 0);
+            result.addDefaultKeypress ('r', juce::ModifierKeys::commandModifier);
+            break;
+        case fileExit:
+            result.setInfo ("Exit", "Quits the application", "File", 0);
+            result.addDefaultKeypress ('q', juce::ModifierKeys::commandModifier);
+            break;
+        case editUndo:
+            result.setInfo ("Undo", "Undoes the last action", "Edit", 0);
+            result.setActive (undoManager.canUndo());
+            result.addDefaultKeypress ('z', juce::ModifierKeys::commandModifier);
+            break;
+        case editRedo:
+            result.setInfo ("Redo", "Redoes the last undone action", "Edit", 0);
+            result.setActive (undoManager.canRedo());
+            result.addDefaultKeypress ('y', juce::ModifierKeys::commandModifier);
+            break;
+        case editSelectAll:
+            result.setInfo ("Select All", "Selects the entire waveform", "Edit", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress ('a', juce::ModifierKeys::commandModifier);
+            break;
+        case editDeselect:
+            result.setInfo ("Deselect", "Clears the current selection", "Edit", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress ('d', juce::ModifierKeys::commandModifier);
+            break;
+        case viewZoomIn:
+            result.setInfo ("Zoom In", "Zooms in horizontally", "View", 0);
+            result.addDefaultKeypress ('=', juce::ModifierKeys::commandModifier);
+            break;
+        case viewZoomOut:
+            result.setInfo ("Zoom Out", "Zooms out horizontally", "View", 0);
+            result.addDefaultKeypress ('-', juce::ModifierKeys::commandModifier);
+            break;
+        case viewZoomFit:
+            result.setInfo ("Zoom to Fit", "Fits entire waveform in view", "View", 0);
+            result.addDefaultKeypress ('0', juce::ModifierKeys::commandModifier);
+            break;
+        case viewShowSpectrogram:
+            result.setInfo ("Show Spectrogram", "Toggles the spectrogram view", "View", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress ('g', juce::ModifierKeys::commandModifier);
+            result.setTicked (spectrogramWindow != nullptr);
+            break;
+        case transportPlay:
+            result.setInfo (isPlaying ? "Pause" : "Play", "Starts/Pauses playback", "Transport", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress (juce::KeyPress::spaceKey, 0);
+            break;
+        case transportStop:
+            result.setInfo ("Stop", "Stops playback", "Transport", 0);
+            result.setActive (hasAudio);
+            result.addDefaultKeypress (juce::KeyPress::escapeKey, 0);
+            break;
+        case optionsAudioSettings:
+            result.setInfo ("Audio Settings...", "Opens audio device settings", "Options", 0);
+            result.setTicked (audioSettingsWindow != nullptr);
+            break;
+        default:
+            break;
+    }
+}
+
+bool StandaloneWindow::perform (const juce::InvocationInfo& info)
+{
+    if (info.commandID == transportPlay || info.commandID == transportPause)
+    {
+        if (mainComponent != nullptr)
+            mainComponent->buttonClicked (&mainComponent->getPlayPauseButton());
+        return true;
+    }
+    
+    if (info.commandID == transportStop)
+    {
+        if (mainComponent != nullptr)
+            mainComponent->buttonClicked (&mainComponent->getStopButton());
+        return true;
+    }
+
+    menuItemSelected (info.commandID, 0);
+    return true;
 }
 
 void StandaloneWindow::detectClicks()
@@ -2939,7 +3086,7 @@ void StandaloneWindow::showAboutDialog()
 
             // Version at bottom of label - smaller
             g.setFont (juce::Font (juce::FontOptions (16.0f)));
-            g.drawText ("Version 1.6.19",
+            g.drawText ("Version 1.6.20",
                        centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.62f,
                        labelRadius * 1.8f, 24.0f,
                        juce::Justification::centred);
@@ -4735,11 +4882,14 @@ void StandaloneWindow::turntableAnalyzer()
 
 void StandaloneWindow::showAudioSettings()
 {
+    if (audioSettingsWindow != nullptr)
+    {
+        delete audioSettingsWindow.getComponent();
+        return;
+    }
+
     // Show JUCE's built-in audio settings dialog
-    juce::DialogWindow::LaunchOptions options;
-    options.dialogTitle = "Audio Settings";
-    options.dialogBackgroundColour = juce::Colours::darkgrey;
-    options.content.setOwned (new juce::AudioDeviceSelectorComponent (
+    auto* content = new juce::AudioDeviceSelectorComponent (
         audioDeviceManager,
         0,  // min input channels
         2,  // max input channels
@@ -4749,9 +4899,17 @@ void StandaloneWindow::showAudioSettings()
         false,  // show MIDI output
         false,  // show channels as stereo pairs
         false   // hide advanced options
-    ));
-    options.content->setSize (500, 400);
-    options.launchAsync();
+    );
+    content->setSize (500, 400);
+
+    auto* dw = new juce::DialogWindow ("Audio Settings", juce::Colours::darkgrey, true, true);
+    dw->setContentOwned (content, true);
+    dw->setUsingNativeTitleBar (true);
+    dw->setResizable (false, false);
+    dw->centreWithSize (dw->getWidth(), dw->getHeight());
+    dw->setVisible (true);
+    
+    audioSettingsWindow = dw;
 }
 
 void StandaloneWindow::showProcessingSettings()
@@ -4996,6 +5154,35 @@ void StandaloneWindow::setUIScale (float newScale)
 // Spectrogram Display
 //==============================================================================
 
+class StandaloneWindow::SpectrogramWindow : public juce::DocumentWindow
+{
+public:
+    SpectrogramWindow (const juce::AudioBuffer<float>& buffer, double sampleRate,
+                      const juce::String& fileName)
+        : DocumentWindow ("Spectrogram - " + fileName,
+                         juce::Colour (0xff1a1a2e),
+                         DocumentWindow::closeButton | DocumentWindow::minimiseButton)
+    {
+        auto* display = new SpectrogramDisplay();
+        display->setSize (800, 400);
+        display->analyzeBuffer (buffer, sampleRate);
+        setContentOwned (display, true);
+
+        setUsingNativeTitleBar (true);
+        setResizable (true, true);
+        centreWithSize (900, 500);
+        setVisible (true);
+    }
+
+    void closeButtonPressed() override
+    {
+        delete this;
+    }
+
+private:
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrogramWindow)
+};
+
 void StandaloneWindow::showSpectrogram()
 {
     if (audioBuffer.getNumSamples() == 0)
@@ -5006,43 +5193,14 @@ void StandaloneWindow::showSpectrogram()
         return;
     }
 
-    // Create a new window to display the spectrogram
-    class SpectrogramWindow : public juce::DocumentWindow
+    if (spectrogramWindow != nullptr)
     {
-    public:
-        SpectrogramWindow (const juce::AudioBuffer<float>& buffer, double sampleRate,
-                          const juce::String& fileName)
-            : DocumentWindow ("Spectrogram - " + fileName,
-                             juce::Colour (0xff1a1a2e),
-                             DocumentWindow::closeButton | DocumentWindow::minimiseButton)
-        {
-            spectrogram = std::make_unique<SpectrogramDisplay>();
-            spectrogram->setSize (800, 400);
-            setContentOwned (spectrogram.get(), true);
-            spectrogram.release(); // Window now owns it
+        delete spectrogramWindow.getComponent();
+        return;
+    }
 
-            // Analyze the buffer
-            auto* display = dynamic_cast<SpectrogramDisplay*> (getContentComponent());
-            if (display != nullptr)
-                display->analyzeBuffer (buffer, sampleRate);
-
-            setUsingNativeTitleBar (true);
-            setResizable (true, true);
-            centreWithSize (900, 500);
-            setVisible (true);
-        }
-
-        void closeButtonPressed() override
-        {
-            delete this;
-        }
-
-    private:
-        std::unique_ptr<SpectrogramDisplay> spectrogram;
-    };
-
-    // Create the spectrogram window (self-deleting)
-    new SpectrogramWindow (audioBuffer, sampleRate, currentFile.getFileName());
+    auto* sw = new SpectrogramWindow (audioBuffer, sampleRate, currentFile.getFileName());
+    spectrogramWindow = sw;
 }
 
 //==============================================================================
@@ -5196,6 +5354,9 @@ StandaloneWindow::MainComponent::MainComponent()
     toolbarEQButton.addListener (this);
     toolbarSpectrumButton.addListener (this);
     toolbarSettingsButton.addListener (this);
+
+    toolbarSpectrumButton.setClickingTogglesState (true);
+    toolbarSettingsButton.setClickingTogglesState (true);
 
     toolbarOpenButton.setTooltip ("Open audio file (Ctrl+O)");
     toolbarSaveButton.setTooltip ("Save session (Ctrl+S)");
@@ -5924,12 +6085,12 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
     else if (button == &toolbarSpectrumButton)
     {
         if (parentWindow)
-            parentWindow->menuItemSelected (StandaloneWindow::viewShowSpectrogram, 0);
+            parentWindow->showSpectrogram();
     }
     else if (button == &toolbarSettingsButton)
     {
         if (parentWindow)
-            parentWindow->menuItemSelected (StandaloneWindow::optionsAudioSettings, 0);
+            parentWindow->showAudioSettings();
     }
 }
 
@@ -5999,87 +6160,19 @@ void StandaloneWindow::MainComponent::sliderValueChanged (juce::Slider* slider)
 
 bool StandaloneWindow::MainComponent::keyPressed (const juce::KeyPress& key)
 {
-    if (key.getModifiers().isCtrlDown() || key.getModifiers().isCommandDown())
-    {
-        if (key.getKeyCode() == 'z' || key.getKeyCode() == 'Z')
-        {
-            if (parentWindow)
-                parentWindow->menuItemSelected (StandaloneWindow::editUndo, 0);
-            return true;
-        }
-        if (key.getKeyCode() == 'y' || key.getKeyCode() == 'Y')
-        {
-            if (parentWindow)
-                parentWindow->menuItemSelected (StandaloneWindow::editRedo, 0);
-            return true;
-        }
-        if (key.getKeyCode() == 'a' || key.getKeyCode() == 'A')
-        {
-            if (parentWindow)
-                parentWindow->menuItemSelected (StandaloneWindow::editSelectAll, 0);
-            return true;
-        }
-        if (key.getKeyCode() == 'g' || key.getKeyCode() == 'G')
-        {
-            if (parentWindow)
-                parentWindow->menuItemSelected (StandaloneWindow::viewShowSpectrogram, 0);
-            return true;
-        }
-        if (key.getKeyCode() == 'q' || key.getKeyCode() == 'Q')
-        {
-            if (parentWindow)
-                parentWindow->requestAppQuit();
-            return true;
-        }
-        if (key.getKeyCode() == 'r' || key.getKeyCode() == 'R')
-        {
-            if (parentWindow)
-                parentWindow->toggleRecording();
-            return true;
-        }
-
-        juce::juce_wchar keyChar = key.getTextCharacter();
-        if (keyChar == '+' || keyChar == '=')
-        {
-            zoomIn();
-            return true;
-        }
-        if (keyChar == '-' || keyChar == '_')
-        {
-            zoomOut();
-            return true;
-        }
-        if (keyChar == '0')
-        {
-            zoomFit();
-            return true;
-        }
-    }
-
-    // Spacebar toggles play/pause
+    // Common keys that should always work
     if (key == juce::KeyPress::spaceKey)
     {
-        if (parentWindow && parentWindow->currentFile.exists())
-        {
-            if (parentWindow->isPlaying)
-            {
-                // Pause playback
-                parentWindow->transportSource.stop();
-                parentWindow->isPlaying = false;
-                playPauseButton.setButtonText ("Play");
-                DBG ("Playback paused (spacebar)");
-            }
-            else
-            {
-                // Start/resume playback
-                seekToSelectionStart();
-                parentWindow->transportSource.start();
-                parentWindow->isPlaying = true;
-                playPauseButton.setButtonText ("Pause");
-                DBG ("Playback started (spacebar)");
-            }
-            return true; // Key was handled
-        }
+        if (parentWindow)
+            parentWindow->perform (juce::InvocationInfo (StandaloneWindow::transportPlay));
+        return true;
+    }
+    
+    if (key == juce::KeyPress::escapeKey)
+    {
+        if (parentWindow)
+            parentWindow->perform (juce::InvocationInfo (StandaloneWindow::transportStop));
+        return true;
     }
 
     // Home key - go to beginning
