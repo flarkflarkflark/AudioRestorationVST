@@ -5,6 +5,7 @@
 #include "WaveformDisplay.h"
 #include "CorrectionListView.h"
 #include "SpectrogramDisplay.h"
+#include "ReaperLookAndFeel.h"
 #include "../Processors/BatchProcessor.h"
 #include "../Processors/TrackDetector.h"
 #include "../Utils/AudioFileManager.h"
@@ -132,10 +133,9 @@ private:
     //==============================================================================
     // UI Components
     class MainComponent;
-    class ScaledContentWrapper;
     std::unique_ptr<MainComponent> mainComponent;
-    std::unique_ptr<ScaledContentWrapper> contentWrapper;
 
+    ReaperLookAndFeel reaperLookAndFeel;
     juce::MenuBarComponent menuBar;
 
     //==============================================================================
@@ -157,6 +157,7 @@ private:
     std::unique_ptr<AudioRecorder> recorder;
     bool isPlaying = false;
     bool isRecording = false;
+    bool monitoringEnabled = true;
     juce::MemoryBlock bufferedRecording;
     float meterLevelLeft = 0.0f;
     float meterLevelRight = 0.0f;
@@ -170,6 +171,7 @@ private:
     void setUIScale (float newScale);
     void applyDenoiserSettings();
     void toggleRecording();
+    void toggleMonitoring();
     void startRecording();
     void stopRecording();
     void setRecordingState (bool recording);
@@ -332,6 +334,7 @@ private:
     juce::TextButton playPauseButton {"Play"};  // Toggle between Play and Pause
     juce::TextButton stopButton {"Stop"};
     juce::TextButton recordButton {"Rec"};
+    juce::ToggleButton monitorButton {"Mon"};
     juce::TextButton forwardButton {">>"};
     juce::ToggleButton loopSelectionButton {"Loop Sel"};
     juce::TextButton zoomToSelectionButton {"Zoom Sel"};
@@ -509,59 +512,3 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };
 
-//==============================================================================
-/**
- * Wrapper component that handles UI scaling - now uses responsive layout
- */
-class StandaloneWindow::ScaledContentWrapper : public juce::Component
-{
-public:
-    ScaledContentWrapper (MainComponent* content, int baseW, int baseH)
-        : contentComponent (content),
-          baseWidth (baseW),
-          baseHeight (baseH)
-    {
-        addAndMakeVisible (content);
-    }
-
-    void setScaleFactor (float newScale)
-    {
-        scaleFactor = newScale;
-        resized();
-    }
-
-    float getScaleFactor() const { return scaleFactor; }
-
-    void resized() override
-    {
-        if (contentComponent != nullptr)
-        {
-            float scaleX = (baseWidth > 0) ? (getWidth() / (float) baseWidth) : 1.0f;
-            float scaleY = (baseHeight > 0) ? (getHeight() / (float) baseHeight) : 1.0f;
-            float scale = juce::jmax (0.1f, juce::jmin (scaleX, scaleY));
-
-            int scaledWidth = juce::roundToInt (baseWidth * scale);
-            int scaledHeight = juce::roundToInt (baseHeight * scale);
-            int offsetX = (getWidth() - scaledWidth) / 2;
-            int offsetY = (getHeight() - scaledHeight) / 2;
-
-            contentComponent->setBounds (0, 0, baseWidth, baseHeight);
-            contentComponent->setTransform (juce::AffineTransform::scale (scale)
-                                                .translated ((float) offsetX / scale,
-                                                             (float) offsetY / scale));
-        }
-    }
-
-    void paint (juce::Graphics& g) override
-    {
-        g.fillAll (juce::Colour (0xff2e2e2e));
-    }
-
-private:
-    MainComponent* contentComponent;
-    float scaleFactor = 1.0f;
-    int baseWidth = 0;
-    int baseHeight = 0;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScaledContentWrapper)
-};

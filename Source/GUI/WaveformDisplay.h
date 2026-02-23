@@ -43,6 +43,9 @@ public:
     /** Update waveform from an audio buffer (after processing) */
     void updateFromBuffer (const juce::AudioBuffer<float>& buffer, double sampleRate);
 
+    /** Add a block of samples to the thumbnail (for real-time recording view) */
+    void addBlock (const float** channelData, int numChannels, int numSamples);
+
     /** Set horizontal zoom level (samples per pixel) */
     void setHorizontalZoom (double samplesPerPixel);
 

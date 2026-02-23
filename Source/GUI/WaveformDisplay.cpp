@@ -120,6 +120,19 @@ void WaveformDisplay::updateFromBuffer (const juce::AudioBuffer<float>& buffer, 
     DBG ("Waveform updated from buffer: " + juce::String (buffer.getNumSamples()) + " samples");
 }
 
+void WaveformDisplay::addBlock (const float** channelData, int numChannels, int numSamples)
+{
+    if (numSamples <= 0 || sampleRate <= 0.0)
+        return;
+
+    // Start sample is current total length in samples
+    int64_t startSample = static_cast<int64_t>(thumbnail.getTotalLength() * sampleRate);
+    
+    // Create a temporary buffer to use the AudioBuffer overload of addBlock
+    juce::AudioBuffer<float> tempBuffer (const_cast<float**>(channelData), numChannels, numSamples);
+    thumbnail.addBlock (startSample, tempBuffer, 0, numSamples);
+}
+
 void WaveformDisplay::setHorizontalZoom (double samplesPerPixel)
 {
     horizontalZoom = juce::jmax (1.0, samplesPerPixel);
@@ -165,8 +178,8 @@ void WaveformDisplay::paint (juce::Graphics& g)
 {
     auto bounds = getLocalBounds();
 
-    // Background
-    g.fillAll (juce::Colour (0xff1e1e1e));
+    // Background - Reaper dark grey
+    g.fillAll (juce::Colour (0xff1a1a1a));
 
     if (thumbnail.getTotalLength() > 0.0)
     {
@@ -189,9 +202,10 @@ void WaveformDisplay::paint (juce::Graphics& g)
     else
     {
         // No audio loaded
-        g.setColour (juce::Colours::grey);
+        g.setColour (juce::Colours::grey.withAlpha (0.5f));
         g.setFont (16.0f);
-        g.drawText ("No audio file loaded", bounds, juce::Justification::centred);
+        g.drawFittedText ("No audio file loaded.\nDrag and drop an audio file here or use File > Record.",
+                         bounds, juce::Justification::centred, 2);
     }
 
     // Border
@@ -677,7 +691,7 @@ void WaveformDisplay::drawWaveform (juce::Graphics& g, const juce::Rectangle<int
     endTime = juce::jmin (totalLength, endTime);
 
     // Draw waveform with zoom applied
-    g.setColour (juce::Colour (0xff4a90e2)); // Blue waveform
+    g.setColour (juce::Colour (0xff88bb88)); // Reaper-like green waveform
     thumbnail.drawChannels (g, bounds, startTime, endTime, verticalZoom);
 }
 

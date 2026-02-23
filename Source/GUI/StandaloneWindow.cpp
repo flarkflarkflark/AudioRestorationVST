@@ -444,14 +444,32 @@ public:
         return std::move (recordedData);
     }
 
+    void setMonitoring (bool enabled)
+    {
+        monitoring.store (enabled);
+    }
+
+    std::function<void(const float**, int, int)> onDataAvailable;
+
     void audioDeviceIOCallbackWithContext (const float* const* inputChannelData, int numInputChannels,
                                            float* const* outputChannelData, int numOutputChannels, int numSamples,
                                            const juce::AudioIODeviceCallbackContext&) override
     {
-        juce::ignoreUnused (outputChannelData, numOutputChannels);
+        if (numSamples <= 0)
+            return;
+
+        // Monitoring: pipe input to output
+        if (monitoring.load() && outputChannelData != nullptr && numOutputChannels > 0 && numInputChannels > 0)
+        {
+            for (int ch = 0; ch < numOutputChannels; ++ch)
+            {
+                int inputCh = ch % numInputChannels;
+                juce::FloatVectorOperations::copy (outputChannelData[ch], inputChannelData[inputCh], numSamples);
+            }
+        }
 
         auto* writer = activeWriter.load();
-        if (writer == nullptr || numSamples <= 0 || numInputChannels <= 0)
+        if (writer == nullptr || numInputChannels <= 0)
             return;
 
         const float* channelsToRecord[2] = { nullptr, nullptr };
@@ -466,6 +484,9 @@ public:
             return;
 
         writer->write (channelsToRecord, numSamples);
+
+        if (onDataAvailable)
+            onDataAvailable (channelsToRecord, channelsToWrite, numSamples);
 
         levelLeft.store (computeMeterLevel (channelsToRecord[0], numSamples));
         const float* rightChannel = channelsToRecord[1] != nullptr ? channelsToRecord[1] : channelsToRecord[0];
@@ -505,6 +526,7 @@ private:
     std::atomic<juce::AudioFormatWriter::ThreadedWriter*> activeWriter { nullptr };
     std::atomic<float> levelLeft { 0.0f };
     std::atomic<float> levelRight { 0.0f };
+    std::atomic<bool> monitoring { true };
     juce::MemoryBlock recordedData;
     double recordingStartMs = 0.0;
     int channelsToWrite = 0;
@@ -588,10 +610,11 @@ private:
 
 StandaloneWindow::StandaloneWindow()
     : DocumentWindow ("Vinyl Restoration Suite",
-                      juce::Colour (0xff2e2e2e),
+                      juce::Colour (0xff212121),
                       DocumentWindow::allButtons),
       menuBar (this)
 {
+    setLookAndFeel (&reaperLookAndFeel);
     setUsingNativeTitleBar (true);
     setResizable (true, true);
 
@@ -617,6 +640,15 @@ StandaloneWindow::StandaloneWindow()
     audioSourcePlayer.setSource (denoiseSource.get());
     audioDeviceManager.addAudioCallback (&audioSourcePlayer);
     recorder = std::make_unique<AudioRecorder>();
+    recorder->setMonitoring (monitoringEnabled);
+    recorder->onDataAvailable = [this](const float** data, int numChannels, int numSamples)
+    {
+        if (mainComponent != nullptr)
+        {
+            // Update thumbnail in real-time
+            mainComponent->getWaveformDisplay().addBlock (data, numChannels, numSamples);
+        }
+    };
     audioDeviceManager.addAudioCallback (recorder.get());
     applyDenoiserSettings();
 
@@ -639,9 +671,8 @@ StandaloneWindow::StandaloneWindow()
     // Add menu bar to main component using base class method
     mainComponent->Component::addAndMakeVisible (menuBar);
 
-    // Create scaled content wrapper
-    contentWrapper = std::make_unique<ScaledContentWrapper> (mainComponent.get(), baseWidth, baseHeight);
-    setContentNonOwned (contentWrapper.get(), true);
+    // Use mainComponent directly as content component
+    setContentNonOwned (mainComponent.get(), true);
 
     // Set initial size
     centreWithSize (1200, 800);
@@ -2908,7 +2939,7 @@ void StandaloneWindow::showAboutDialog()
 
             // Version at bottom of label - smaller
             g.setFont (juce::Font (juce::FontOptions (16.0f)));
-            g.drawText ("Version 1.6.12",
+            g.drawText ("Version 1.6.19",
                        centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.62f,
                        labelRadius * 1.8f, 24.0f,
                        juce::Justification::centred);
@@ -4768,6 +4799,13 @@ void StandaloneWindow::toggleRecording()
         startRecording();
 }
 
+void StandaloneWindow::toggleMonitoring()
+{
+    monitoringEnabled = !monitoringEnabled;
+    if (recorder != nullptr)
+        recorder->setMonitoring (monitoringEnabled);
+}
+
 void StandaloneWindow::startRecording()
 {
     if (isRecording)
@@ -4940,28 +4978,18 @@ void StandaloneWindow::setUIScale (float newScale)
 
     uiScaleFactor = juce::jlimit (0.25f, 4.0f, newScale);
 
-    // Calculate new window size
-    int scaledWidth = juce::roundToInt (baseWidth * uiScaleFactor);
-    int scaledHeight = juce::roundToInt (baseHeight * uiScaleFactor);
-
-    // Apply scale via the wrapper
-    if (contentWrapper != nullptr)
-    {
-        contentWrapper->setScaleFactor (uiScaleFactor);
-        contentWrapper->setSize (scaledWidth, scaledHeight);
-    }
-
     // Update window constraints based on scale
     setResizeLimits (
         juce::roundToInt (600 * uiScaleFactor),
         juce::roundToInt (400 * uiScaleFactor),
-        juce::roundToInt (3840 * uiScaleFactor),
-        juce::roundToInt (2160 * uiScaleFactor));
+        juce::roundToInt (7680 * uiScaleFactor), // support 8k
+        juce::roundToInt (4320 * uiScaleFactor));
 
-    // Resize the window to fit the scaled content
-    setSize (scaledWidth, scaledHeight);
-
-    DBG ("UI Scale set to: " + juce::String (uiScaleFactor * 100.0f, 0) + "%");
+    // Note: Since we removed the ScaledContentWrapper, we don't need to manually
+    // set the size here unless we want to "reset" the window to the base size at this scale.
+    // Let's just update the constraints.
+    
+    DBG ("UI Scale constraints updated for: " + juce::String (uiScaleFactor * 100.0f, 0) + "%");
 }
 
 //==============================================================================
@@ -5038,6 +5066,7 @@ StandaloneWindow::MainComponent::MainComponent()
     addAndMakeVisible (playPauseButton);
     addAndMakeVisible (stopButton);
     addAndMakeVisible (recordButton);
+    addAndMakeVisible (monitorButton);
     addAndMakeVisible (forwardButton);
     addAndMakeVisible (loopSelectionButton);
     addAndMakeVisible (zoomToSelectionButton);
@@ -5046,6 +5075,7 @@ StandaloneWindow::MainComponent::MainComponent()
     playPauseButton.addListener (this);
     stopButton.addListener (this);
     recordButton.addListener (this);
+    monitorButton.addListener (this);
     forwardButton.addListener (this);
     loopSelectionButton.addListener (this);
     zoomToSelectionButton.addListener (this);
@@ -5054,15 +5084,18 @@ StandaloneWindow::MainComponent::MainComponent()
     playPauseButton.setTooltip ("Play/Pause playback (Spacebar)");
     stopButton.setTooltip ("Stop playback and return to start");
     recordButton.setTooltip ("Start recording");
+    monitorButton.setTooltip ("Enable/Disable input monitoring");
+    monitorButton.setClickingTogglesState (true);
+    monitorButton.setToggleState (true, juce::dontSendNotification);
     forwardButton.setTooltip ("Skip forward 5 seconds");
     loopSelectionButton.setTooltip ("Loop playback within selection");
     loopSelectionButton.setClickingTogglesState (true);
     zoomToSelectionButton.setTooltip ("Zoom to current selection");
     timeLabel.setTooltip ("Current playback time");
 
-    recordButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff5a1f1f));
-    recordButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffc0392b));
-    recordButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    recordButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff4a1a1a));
+    recordButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffaa2222));
+    recordButton.setColour (juce::TextButton::textColourOffId, juce::Colour (0xffcccccc));
     recordButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
 
     // Enable keyboard focus for spacebar control
@@ -5175,15 +5208,15 @@ StandaloneWindow::MainComponent::MainComponent()
     toolbarSpectrumButton.setTooltip ("Show spectrogram view");
     toolbarSettingsButton.setTooltip ("Audio device settings");
 
-    // Style toolbar buttons with gold accent color
-    auto goldColor = juce::Colour (0xffe8c547);
-    auto darkBg = juce::Colour (0xff3a3a3a);
+    // Style toolbar buttons with Reaper-like style
+    auto textGrey = juce::Colour (0xffcccccc);
+    auto darkBg = juce::Colour (0xff333333);
     for (auto* btn : { &toolbarOpenButton, &toolbarSaveButton, &toolbarUndoButton, &toolbarRedoButton,
                        &toolbarDetectButton, &toolbarRemoveButton, &toolbarNoiseButton, &toolbarEQButton,
                        &toolbarSpectrumButton, &toolbarSettingsButton })
     {
         btn->setColour (juce::TextButton::buttonColourId, darkBg);
-        btn->setColour (juce::TextButton::textColourOffId, goldColor);
+        btn->setColour (juce::TextButton::textColourOffId, textGrey);
     }
 
     // Selection editor
@@ -5520,7 +5553,7 @@ StandaloneWindow::MainComponent::~MainComponent()
 
 void StandaloneWindow::MainComponent::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colour (0xff2e2e2e));
+    g.fillAll (juce::Colour (0xff212121)); // Reaper dark grey
 
     // Draw logo in the top right corner (in the volume slider area)
     if (logoImage.isValid())
@@ -5624,6 +5657,8 @@ void StandaloneWindow::MainComponent::resized()
     stopButton.setBounds (transportArea.removeFromLeft (60));
     transportArea.removeFromLeft (5);
     recordButton.setBounds (transportArea.removeFromLeft (60));
+    transportArea.removeFromLeft (5);
+    monitorButton.setBounds (transportArea.removeFromLeft (50));
     transportArea.removeFromLeft (5);
     forwardButton.setBounds (transportArea.removeFromLeft (50));
     transportArea.removeFromLeft (5);
@@ -5780,6 +5815,11 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
     {
         if (parentWindow)
             parentWindow->toggleRecording();
+    }
+    else if (button == &monitorButton)
+    {
+        if (parentWindow)
+            parentWindow->toggleMonitoring();
     }
     else if (button == &rewindButton)
     {
@@ -6127,8 +6167,12 @@ void StandaloneWindow::MainComponent::setCorrectionListVisible (bool visible)
 void StandaloneWindow::MainComponent::setRecording (bool recording)
 {
     recordButton.setToggleState (recording, juce::dontSendNotification);
-    recordButton.setButtonText (recording ? "REC" : "Rec");
+    recordButton.setButtonText (recording ? "STOP" : "Rec");
     recordButton.setTooltip (recording ? "Stop recording" : "Start recording");
+    
+    if (parentWindow != nullptr)
+        monitorButton.setToggleState (parentWindow->monitoringEnabled, juce::dontSendNotification);
+        
     if (recording)
         playPauseButton.setButtonText ("Play");
 
