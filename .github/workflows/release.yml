@@ -63,8 +63,8 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # ===== Linux + macOS: losse .vst3 en standalone =====
-      - name: Collect plugin and standalone (Linux/macOS)
+      # ===== Linux + macOS: Collect and Zip =====
+      - name: Collect and Zip plugin/standalone (Linux/macOS)
         if: matrix.os != 'windows-latest'
         run: |
           cd build
@@ -80,27 +80,36 @@ jobs:
           pwd
           ls -R
 
-          # Zoek .vst3
-          PLUGIN=$(find . -type f -name "*.vst3" | head -1)
-          # Zoek standalone: .app op macOS, executable op Linux
-          STANDALONE=$(find . -type f \( -name "*.app" -o -perm -u+x \) | head -1)
+          # Find artifacts
+          PLUGIN=$(find . -type f -name "*.vst3" -o -type d -name "*.vst3" | head -1)
+          # Standalone: .app for macOS (dir), executable for Linux (file)
+          STANDALONE=$(find . -type d -name "*.app" -o -type f -perm -u+x ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" ! -name "cpack*" ! -name "*.vst3" | head -1)
 
           echo "Found plugin: $PLUGIN"
           echo "Found standalone: $STANDALONE"
 
           mkdir -p ../../release-files
 
+          # Copy and Zip VST3
           if [ -n "$PLUGIN" ]; then
-            cp "$PLUGIN" "../../release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3"
+            cp -R "$PLUGIN" "../../release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3"
+            cd ../../release-files
+            zip -r "AudioRestoration-${{ matrix.artifact_name }}-VST3.zip" "AudioRestoration-${{ matrix.artifact_name }}.vst3"
+            cd - > /dev/null
           fi
 
+          # Copy and Zip Standalone
           if [ -n "$STANDALONE" ]; then
-            # macOS: .app is een directory; Linux: enkel bestand
-            if [ -d "$STANDALONE" ]; then
-              cp -R "$STANDALONE" "../../release-files/AudioRestoration-${{ matrix.artifact_name }}-Standalone"
-            else
-              cp "$STANDALONE" "../../release-files/AudioRestoration-${{ matrix.artifact_name }}-Standalone"
+            DEST_NAME="AudioRestoration-${{ matrix.artifact_name }}-Standalone"
+            if [[ "$STANDALONE" == *.app ]]; then
+               DEST_NAME="$DEST_NAME.app"
             fi
+            
+            cp -R "$STANDALONE" "../../release-files/$DEST_NAME"
+            
+            cd ../../release-files
+            zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$DEST_NAME"
+            cd - > /dev/null
           fi
 
       - name: Upload Release Assets (Linux/macOS)
@@ -108,13 +117,12 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            build/release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3
-            build/release-files/AudioRestoration-${{ matrix.artifact_name }}-Standalone/**
+            build/release-files/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ===== Windows: losse .vst3 + .exe =====
-      - name: Collect plugin and standalone (Windows)
+      # ===== Windows: Collect and Zip =====
+      - name: Collect and Zip plugin/standalone (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
@@ -137,13 +145,25 @@ jobs:
           Write-Host "Found standalone: $($standalone.FullName)"
 
           New-Item -ItemType Directory -Path ../../release-files -Force | Out-Null
-
+          
+          # Copy and Zip VST3
           if ($plugin) {
-            Copy-Item $plugin.FullName ../../release-files/AudioRestoration-Windows.vst3 -Force
+            $destVst = "../../release-files/AudioRestoration-Windows.vst3"
+            Copy-Item $plugin.FullName -Destination $destVst -Recurse -Force
+            
+            # Zip it
+            $zipPath = "../../release-files/AudioRestoration-Windows-VST3.zip"
+            Compress-Archive -Path $destVst -DestinationPath $zipPath -Force
           }
 
+          # Copy and Zip Standalone
           if ($standalone) {
-            Copy-Item $standalone.FullName ../../release-files/AudioRestoration-Windows-Standalone.exe -Force
+            $destExe = "../../release-files/AudioRestoration-Windows-Standalone.exe"
+            Copy-Item $standalone.FullName -Destination $destExe -Force
+            
+            # Zip it
+            $zipPath = "../../release-files/AudioRestoration-Windows-Standalone.zip"
+            Compress-Archive -Path $destExe -DestinationPath $zipPath -Force
           }
 
       - name: Upload Release Assets (Windows)
@@ -151,8 +171,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            build/release-files/AudioRestoration-Windows.vst3
-            build/release-files/AudioRestoration-Windows-Standalone.exe
+            build/release-files/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
