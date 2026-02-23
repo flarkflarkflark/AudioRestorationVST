@@ -55,7 +55,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libglu1-mesa-dev \
             mesa-common-dev \
-            libgtk-3-dev
+            libgtk-3-dev \
+            patchelf
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -63,58 +64,70 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # ===== Linux + macOS: Collect and Zip =====
+      # ===== Linux + macOS: Collect, Fix, and Zip =====
       - name: Collect and Zip plugin/standalone (Linux/macOS)
         if: matrix.os != 'windows-latest'
         run: |
           mkdir -p release-files
 
           echo "=== Searching for VST3 and Standalone ==="
-          # Find VST3 (file on Linux, directory on macOS)
           PLUGIN=$(find build -name "*.vst3" | head -1)
-          
-          # Standalone macOS: .app directory
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             STANDALONE=$(find build -type d -name "*.app" | head -1)
           else
-            # Standalone Linux: executable file
             STANDALONE=$(find build -type f -perm -u+x ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" ! -name "cpack*" ! -name "*.vst3" ! -name "ctest*" ! -name "JUCE*" | grep -i "VinylRestorationSuite" | head -1)
           fi
 
-          echo "Found plugin: $PLUGIN"
-          echo "Found standalone: $STANDALONE"
+          # Function to fix shared library dependencies
+          fix_deps() {
+            local binary="$1"
+            local lib_name="$2"
+            local lib_pattern="$3"
+            
+            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+              local lib_src=$(find build -name "$lib_pattern" | head -1)
+              if [ -n "$lib_src" ]; then
+                cp -P $(dirname "$lib_src")/$lib_pattern "$(dirname "$binary")/"
+                patchelf --set-rpath '$ORIGIN' "$binary"
+              fi
+            elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+              local lib_src=$(find build -name "$lib_name" | head -1)
+              if [ -n "$lib_src" ]; then
+                cp "$lib_src" "$(dirname "$binary")/"
+                local old_path=$(otool -L "$binary" | grep "$lib_name" | awk '{print $1}')
+                if [ -n "$old_path" ]; then
+                  install_name_tool -change "$old_path" "@loader_path/$lib_name" "$binary"
+                fi
+              fi
+            fi
+          }
 
-          # Copy and Zip VST3
+          # Process VST3
           if [ -n "$PLUGIN" ]; then
-            cp -R "$PLUGIN" "release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3"
-            cd release-files
-            zip -r "AudioRestoration-${{ matrix.artifact_name }}-VST3.zip" "AudioRestoration-${{ matrix.artifact_name }}.vst3"
-            cd ..
+            DEST="release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3"
+            cp -R "$PLUGIN" "$DEST"
+            # Find the actual binary inside the bundle
+            INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -perm +111 \) ! -name "*.dylib" | head -1)
+            if [ -n "$INNER_BIN" ]; then
+              fix_deps "$INNER_BIN" "libonnxruntime.dylib" "libonnxruntime.so*"
+            fi
+            cd release-files && zip -r "AudioRestoration-${{ matrix.artifact_name }}-VST3.zip" "$(basename "$DEST")" && cd ..
           fi
 
-          # Copy and Zip Standalone
+          # Process Standalone
           if [ -n "$STANDALONE" ]; then
             DEST_NAME="AudioRestoration-${{ matrix.artifact_name }}-Standalone"
             if [[ "$STANDALONE" == *.app ]]; then
-               DEST_NAME="$DEST_NAME.app"
+               DEST_PATH="release-files/$DEST_NAME.app"
+               cp -R "$STANDALONE" "$DEST_PATH"
+               INNER_BIN=$(find "$DEST_PATH" -type f -perm +111 ! -name "*.dylib" | head -1)
+               fix_deps "$INNER_BIN" "libonnxruntime.dylib" "libonnxruntime.so*"
+            else
+               DEST_PATH="release-files/$DEST_NAME"
+               cp "$STANDALONE" "$DEST_PATH"
+               fix_deps "$DEST_PATH" "libonnxruntime.dylib" "libonnxruntime.so*"
             fi
-            
-            cp -R "$STANDALONE" "release-files/$DEST_NAME"
-            
-            # For Linux, also copy libonnxruntime.so and fix rpath
-            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-              ONNX_LIB=$(find build -name "libonnxruntime.so*" | head -1)
-              if [ -n "$ONNX_LIB" ]; then
-                cp "$ONNX_LIB" "release-files/"
-                # Set rpath so it looks for the .so in the same directory as the executable
-                sudo apt-get install -y patchelf
-                patchelf --set-rpath '$ORIGIN' "release-files/$DEST_NAME"
-              fi
-            fi
-            
-            cd release-files
-            zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$DEST_NAME" $([[ "${{ matrix.os }}" == "ubuntu-latest" ]] && echo "libonnxruntime.so*")
-            cd ..
+            cd release-files && zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$(basename "$DEST_PATH")" $([[ "${{ matrix.os }}" == "ubuntu-latest" && "$STANDALONE" != *.app ]] && echo "libonnxruntime.so*") && cd ..
           fi
 
       - name: Upload Release Assets (Linux/macOS)
@@ -144,20 +157,22 @@ jobs:
           if ($plugin) {
             $destVst = "release-files/AudioRestoration-Windows.vst3"
             Copy-Item $plugin.FullName -Destination $destVst -Recurse -Force
-            
-            # Zip it
+            # Zip the entire folder
             $zipPath = "release-files/AudioRestoration-Windows-VST3.zip"
             Compress-Archive -Path $destVst -DestinationPath $zipPath -Force
           }
 
           # Copy and Zip Standalone
           if ($standalone) {
-            $destExe = "release-files/AudioRestoration-Windows-Standalone.exe"
-            Copy-Item $standalone.FullName -Destination $destExe -Force
+            $destDir = New-Item -ItemType Directory -Path "release-files/AudioRestoration-Windows-Standalone" -Force
+            Copy-Item $standalone.FullName -Destination $destDir.FullName -Force
+            # Also copy any DLLs from the standalone's build directory
+            $standaloneDir = Split-Path $standalone.FullName
+            Get-ChildItem -Path $standaloneDir -Filter *.dll | Copy-Item -Destination $destDir.FullName -Force
             
-            # Zip it
+            # Zip the folder containing exe + dlls
             $zipPath = "release-files/AudioRestoration-Windows-Standalone.zip"
-            Compress-Archive -Path $destExe -DestinationPath $zipPath -Force
+            Compress-Archive -Path $destDir.FullName -DestinationPath $zipPath -Force
           }
 
       - name: Upload Release Assets (Windows)
