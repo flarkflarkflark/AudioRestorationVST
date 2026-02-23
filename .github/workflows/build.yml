@@ -60,13 +60,13 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-VST3
-        path: build/AudioRestoration_artefacts/Release/VST3/
+        path: build/VinylRestorationSuite_artefacts/Release/VST3/
 
     - name: Upload Standalone (Linux)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Linux-Standalone
-        path: build/AudioRestoration_artefacts/Release/Standalone/
+        path: build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
 
   build-macos:
     name: Build on macOS
@@ -91,17 +91,14 @@ jobs:
         echo ""
         echo "=== Looking for VST3 and app bundles ==="
         find build -name "*.vst3" -o -name "*.app" || true
-        echo ""
-        echo "=== AudioRestoration_artefacts directory ==="
-        find build/AudioRestoration_artefacts -type f || true
 
     - name: Upload VST3 (macOS)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-macOS-VST3
         path: |
-          build/AudioRestoration_artefacts/VST3/
-          build/AudioRestoration_artefacts/Release/VST3/
+          build/VinylRestorationSuite_artefacts/VST3/
+          build/VinylRestorationSuite_artefacts/Release/VST3/
         if-no-files-found: warn
 
     - name: Upload Standalone (macOS)
@@ -109,8 +106,8 @@ jobs:
       with:
         name: AudioRestoration-macOS-Standalone
         path: |
-          build/AudioRestoration_artefacts/Standalone/
-          build/AudioRestoration_artefacts/Release/Standalone/
+          build/VinylRestorationSuiteStandalone_artefacts/Standalone/
+          build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
         if-no-files-found: warn
 
   build-windows:
@@ -141,10 +138,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Windows-VST3
-        path: build/AudioRestoration_artefacts/Release/VST3/
+        path: build/VinylRestorationSuite_artefacts/Release/VST3/
 
     - name: Upload Standalone (Windows)
       uses: actions/upload-artifact@v4
       with:
         name: AudioRestoration-Windows-Standalone
-        path: build/AudioRestoration_artefacts/Release/Standalone/
+        path: build/VinylRestorationSuiteStandalone_artefacts/Release/Standalone/
