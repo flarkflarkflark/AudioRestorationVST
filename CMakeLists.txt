@@ -4,7 +4,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(VinylRestorationSuite VERSION 1.6.22)
+project(VinylRestorationSuite VERSION 1.6.23)
 
 # Add JUCE as a subdirectory (using local submodule)
 add_subdirectory(JUCE)
@@ -481,7 +481,7 @@ option(VRS_COPY_PLUGIN_AFTER_BUILD "Copy VST3 to system folder after build" OFF)
 
 # Add the plugin target (VST3 only)
 juce_add_plugin(VinylRestorationSuite
-    PRODUCT_NAME "Vinyl Restoration Suite v1.6.22"
+    PRODUCT_NAME "Vinyl Restoration Suite v1.6.23"
     COMPANY_NAME "flarkAUDIO"
     PLUGIN_MANUFACTURER_CODE Flrk
     PLUGIN_CODE Vrs1

@@ -491,72 +491,6 @@ bool OnnxDenoiser::tryCreateSessionForProvider (const juce::File& file, Provider
     return session != nullptr;
 }
 
-void OnnxDenoiser::RingBuffer::resize (int newCapacity)
-{
-    capacity = juce::jmax (newCapacity, 1);
-    buffer.assign ((size_t) capacity, 0.0f);
-    readIndex = 0;
-    writeIndex = 0;
-    availableSamples = 0;
-}
-
-void OnnxDenoiser::RingBuffer::clear()
-{
-    readIndex = 0;
-    writeIndex = 0;
-    availableSamples = 0;
-    std::fill (buffer.begin(), buffer.end(), 0.0f);
-}
-
-void OnnxDenoiser::RingBuffer::push (const float* data, int count)
-{
-    if (count <= 0)
-        return;
-
-    if (count > capacity)
-        count = capacity;
-
-    int remaining = count;
-    while (remaining > 0)
-    {
-        int space = capacity - writeIndex;
-        int toCopy = juce::jmin (space, remaining);
-        std::memcpy (buffer.data() + writeIndex, data + (count - remaining), sizeof (float) * (size_t) toCopy);
-        writeIndex = (writeIndex + toCopy) % capacity;
-        remaining -= toCopy;
-    }
-
-    availableSamples = juce::jmin (capacity, availableSamples + count);
-    if (availableSamples == capacity)
-        readIndex = writeIndex;
-}
-
-int OnnxDenoiser::RingBuffer::pop (float* dest, int count, bool fillWithZeros)
-{
-    if (count <= 0)
-        return 0;
-
-    int toRead = juce::jmin (count, availableSamples);
-    int remaining = toRead;
-    while (remaining > 0)
-    {
-        int space = capacity - readIndex;
-        int toCopy = juce::jmin (space, remaining);
-        std::memcpy (dest + (toRead - remaining), buffer.data() + readIndex, sizeof (float) * (size_t) toCopy);
-        readIndex = (readIndex + toCopy) % capacity;
-        remaining -= toCopy;
-    }
-
-    availableSamples -= toRead;
-
-    if (fillWithZeros && toRead < count)
-    {
-        std::fill (dest + toRead, dest + count, 0.0f);
-    }
-
-    return toRead;
-}
-
 std::vector<int64_t> OnnxDenoiser::resolveInputShape (int frameSize) const
 {
     if (modelInputShape.empty())
@@ -760,7 +694,78 @@ OnnxDenoiser::~OnnxDenoiser() = default;
 void OnnxDenoiser::prepare (double, int, int) {}
 void OnnxDenoiser::reset() {}
 void OnnxDenoiser::setModelPath (const juce::File&) {}
+void OnnxDenoiser::clearModelPath() {}
+void OnnxDenoiser::setPreferredProvider (Provider) {}
 bool OnnxDenoiser::loadDefaultModelIfNeeded() { return false; }
 void OnnxDenoiser::processBlock (juce::AudioBuffer<float>&, float) {}
 
+juce::String OnnxDenoiser::providerToString (Provider) { return "Disabled"; }
+OnnxDenoiser::Provider OnnxDenoiser::providerFromString (const juce::String&) { return Provider::cpu; }
+
 #endif
+
+void OnnxDenoiser::RingBuffer::resize (int newCapacity)
+{
+    capacity = juce::jmax (newCapacity, 1);
+    buffer.assign ((size_t) capacity, 0.0f);
+    readIndex = 0;
+    writeIndex = 0;
+    availableSamples = 0;
+}
+
+void OnnxDenoiser::RingBuffer::clear()
+{
+    readIndex = 0;
+    writeIndex = 0;
+    availableSamples = 0;
+    std::fill (buffer.begin(), buffer.end(), 0.0f);
+}
+
+void OnnxDenoiser::RingBuffer::push (const float* data, int count)
+{
+    if (count <= 0)
+        return;
+
+    if (count > capacity)
+        count = capacity;
+
+    int remaining = count;
+    while (remaining > 0)
+    {
+        int space = capacity - writeIndex;
+        int toCopy = juce::jmin (space, remaining);
+        std::memcpy (buffer.data() + writeIndex, data + (count - remaining), sizeof (float) * (size_t) toCopy);
+        writeIndex = (writeIndex + toCopy) % capacity;
+        remaining -= toCopy;
+    }
+
+    availableSamples = juce::jmin (capacity, availableSamples + count);
+    if (availableSamples == capacity)
+        readIndex = writeIndex;
+}
+
+int OnnxDenoiser::RingBuffer::pop (float* dest, int count, bool fillWithZeros)
+{
+    if (count <= 0)
+        return 0;
+
+    int toRead = juce::jmin (count, availableSamples);
+    int remaining = toRead;
+    while (remaining > 0)
+    {
+        int space = capacity - readIndex;
+        int toCopy = juce::jmin (space, remaining);
+        std::memcpy (dest + (toRead - remaining), buffer.data() + readIndex, sizeof (float) * (size_t) toCopy);
+        readIndex = (readIndex + toCopy) % capacity;
+        remaining -= toCopy;
+    }
+
+    availableSamples -= toRead;
+
+    if (fillWithZeros && toRead < count)
+    {
+        std::fill (dest + toRead, dest + count, 0.0f);
+    }
+
+    return toRead;
+}
