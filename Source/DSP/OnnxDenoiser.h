@@ -30,7 +30,14 @@ public:
     void setEnabled (bool shouldEnable) { enabled = shouldEnable; }
     bool isEnabled() const { return enabled; }
 
-    bool isReady() const { return session != nullptr; }
+    bool isReady() const
+    {
+#if defined(ENABLE_ONNX_RUNTIME)
+        return session != nullptr;
+#else
+        return false;
+#endif
+    }
 
     void setModelPath (const juce::File& file);
     void clearModelPath();

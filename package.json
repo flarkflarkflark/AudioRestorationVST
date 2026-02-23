@@ -1,6 +1,6 @@
 {
   "name": "@flarkflarkflark/audio-restoration",
-  "version": "1.6.21",
+  "version": "1.6.22",
   "description": "Professional audio restoration VST3 and Standalone application",
   "main": "index.js",
   "files": [

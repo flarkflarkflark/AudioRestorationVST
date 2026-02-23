@@ -675,8 +675,9 @@ StandaloneWindow::StandaloneWindow()
     // Add menu bar to main component using base class method
     mainComponent->Component::addAndMakeVisible (menuBar);
 
-    // Use mainComponent directly as content component
-    setContentNonOwned (mainComponent.get(), true);
+    // Create responsive scaled wrapper
+    scaledWrapper = std::make_unique<ResponsiveScaledWrapper> (mainComponent.get());
+    setContentNonOwned (scaledWrapper.get(), true);
 
     // Set initial size
     centreWithSize (1200, 800);
@@ -1697,7 +1698,7 @@ void StandaloneWindow::getCommandInfo (juce::CommandID commandID, juce::Applicat
     }
 }
 
-bool StandaloneWindow::perform (const juce::ApplicationCommandTarget::InvocationInfo& info)
+bool StandaloneWindow::perform (const InvocationInfo& info)
 {
     if (info.commandID == transportPlay || info.commandID == transportPause)
     {
@@ -3085,7 +3086,7 @@ void StandaloneWindow::showAboutDialog()
 
             // Version at bottom of label - smaller
             g.setFont (juce::Font (juce::FontOptions (16.0f)));
-            g.drawText ("Version 1.6.21",
+            g.drawText ("Version 1.6.22",
                        centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.62f,
                        labelRadius * 1.8f, 24.0f,
                        juce::Justification::centred);
@@ -5020,6 +5021,9 @@ void StandaloneWindow::startRecording()
         return;
     }
 
+    if (mainComponent != nullptr)
+        mainComponent->getWaveformDisplay().prepareForRecording (deviceSampleRate, juce::jmin (2, inputChannels));
+
     bufferedRecording.reset();
     setRecordingState (true);
 
@@ -5135,18 +5139,18 @@ void StandaloneWindow::setUIScale (float newScale)
 
     uiScaleFactor = juce::jlimit (0.25f, 4.0f, newScale);
 
+    // Apply scale via the wrapper
+    if (scaledWrapper != nullptr)
+        scaledWrapper->setScaleFactor (uiScaleFactor);
+
     // Update window constraints based on scale
     setResizeLimits (
         juce::roundToInt (600 * uiScaleFactor),
         juce::roundToInt (400 * uiScaleFactor),
         juce::roundToInt (7680 * uiScaleFactor), // support 8k
         juce::roundToInt (4320 * uiScaleFactor));
-
-    // Note: Since we removed the ScaledContentWrapper, we don't need to manually
-    // set the size here unless we want to "reset" the window to the base size at this scale.
-    // Let's just update the constraints.
     
-    DBG ("UI Scale constraints updated for: " + juce::String (uiScaleFactor * 100.0f, 0) + "%");
+    DBG ("UI Scale set to: " + juce::String (uiScaleFactor * 100.0f, 0) + "%");
 }
 
 //==============================================================================

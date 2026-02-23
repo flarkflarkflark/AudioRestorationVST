@@ -48,7 +48,7 @@ public:
     juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
     void getAllCommands (juce::Array<juce::CommandID>& commands) override;
     void getCommandInfo (juce::CommandID commandID, juce::ApplicationCommandInfo& result) override;
-    bool perform (const juce::ApplicationCommandTarget::InvocationInfo& info) override;
+    bool perform (const InvocationInfo& info) override;
 
     //==============================================================================
     // DocumentWindow overrides
@@ -142,6 +142,9 @@ private:
     // UI Components
     class MainComponent;
     std::unique_ptr<MainComponent> mainComponent;
+    
+    class ResponsiveScaledWrapper;
+    std::unique_ptr<ResponsiveScaledWrapper> scaledWrapper;
 
     ReaperLookAndFeel reaperLookAndFeel;
     juce::MenuBarComponent menuBar;
@@ -531,5 +534,43 @@ private:
     bool seekToSelectionStart();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
+};
+
+//==============================================================================
+/**
+ * Wrapper component that handles UI scaling without forcing aspect ratio
+ */
+class StandaloneWindow::ResponsiveScaledWrapper : public juce::Component
+{
+public:
+    ResponsiveScaledWrapper (MainComponent* content) : contentComponent (content)
+    {
+        addAndMakeVisible (contentComponent);
+    }
+
+    void setScaleFactor (float newScale)
+    {
+        scaleFactor = newScale;
+        resized();
+    }
+
+    float getScaleFactor() const { return scaleFactor; }
+
+    void resized() override
+    {
+        if (contentComponent != nullptr)
+        {
+            contentComponent->setTransform (juce::AffineTransform::scale (scaleFactor));
+            contentComponent->setBounds (0, 0, 
+                                         juce::roundToInt (getWidth() / scaleFactor), 
+                                         juce::roundToInt (getHeight() / scaleFactor));
+        }
+    }
+
+private:
+    MainComponent* contentComponent;
+    float scaleFactor = 1.0f;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ResponsiveScaledWrapper)
 };
 
