@@ -139,6 +139,23 @@ public:
         DBG ("Undo history cleared");
     }
 
+    /** Perform undo up to a specific index in the undo history list (newest first) */
+    bool performUndoTo (int index, juce::AudioBuffer<float>& currentBuffer, double& currentSampleRate)
+    {
+        if (index < 0 || index >= (int)undoStack.size())
+            return false;
+
+        // Perform undo multiple times
+        int undosToPerform = index + 1;
+        bool success = false;
+        for (int i = 0; i < undosToPerform; ++i)
+        {
+            success = undo (currentBuffer, currentSampleRate);
+            if (!success) break;
+        }
+        return success;
+    }
+
     /** Get number of undo states */
     int getNumUndoStates() const { return static_cast<int> (undoStack.size()); }
 

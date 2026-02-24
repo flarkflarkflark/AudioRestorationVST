@@ -120,6 +120,18 @@ void WaveformDisplay::updateFromBuffer (const juce::AudioBuffer<float>& buffer, 
     DBG ("Waveform updated from buffer: " + juce::String (buffer.getNumSamples()) + " samples");
 }
 
+void WaveformDisplay::prepareForRecording (double newSampleRate, int numChannels)
+{
+    sampleRate = newSampleRate;
+    thumbnail.clear();
+    thumbnail.reset (numChannels, newSampleRate);
+    clickMarkers.clear();
+    selectionStart = -1;
+    selectionEnd = -1;
+    playbackPosition = 0.0;
+    repaint();
+}
+
 void WaveformDisplay::addBlock (const float** channelData, int numChannels, int numSamples)
 {
     if (numSamples <= 0 || sampleRate <= 0.0)
@@ -187,7 +199,16 @@ void WaveformDisplay::paint (juce::Graphics& g)
         drawTimeRuler (g, rulerBounds);
 
         auto waveformBounds = bounds;
-        drawWaveform (g, waveformBounds);
+        
+        if (showSpectralView)
+        {
+            drawSpectrogram (g, waveformBounds);
+        }
+        else
+        {
+            drawWaveform (g, waveformBounds);
+        }
+        
         drawClickMarkers (g, waveformBounds);
         drawSelection (g, waveformBounds);
         drawPlaybackCursor (g, waveformBounds);
@@ -452,6 +473,9 @@ void WaveformDisplay::showContextMenu (const juce::MouseEvent& event)
     editMenu.addItem (actionPaste, "Paste                   Ctrl+V", hasClipboardData());
     editMenu.addItem (actionDeleteSelection, "Delete Selection        Del", hasSelection());
     editMenu.addSeparator();
+    editMenu.addItem (actionFadeIn, "Apply Fade-in", hasSelection());
+    editMenu.addItem (actionFadeOut, "Apply Fade-out", hasSelection());
+    editMenu.addSeparator();
     editMenu.addItem (actionCropToSelection, "Crop to Selection", hasSelection());
     editMenu.addItem (actionSelectAll, "Select All              Ctrl+A", thumbnail.getTotalLength() > 0.0);
     menu.addSubMenu ("Edit", editMenu);
@@ -465,6 +489,8 @@ void WaveformDisplay::showContextMenu (const juce::MouseEvent& event)
     juce::PopupMenu processMenu;
     processMenu.addItem (actionDetectClicks, "Detect Clicks");
     processMenu.addItem (actionRemoveClicks, "Remove Clicks");
+    processMenu.addSeparator();
+    processMenu.addItem (actionAddTrackMarker, "Add Track Marker at Cursor");
     processMenu.addSeparator();
     processMenu.addItem (actionNoiseReduction, "Noise Reduction...");
     menu.addSubMenu ("Process", processMenu);
@@ -859,4 +885,44 @@ void WaveformDisplay::drawSelection (juce::Graphics& g, const juce::Rectangle<in
     float handleY = bounds.getY() + 4.0f;
     g.fillRect (x1 - selectionHandleWidth * 0.5f, handleY, (float) selectionHandleWidth, handleHeight);
     g.fillRect (x2 - selectionHandleWidth * 0.5f, handleY, (float) selectionHandleWidth, handleHeight);
+}
+
+void WaveformDisplay::drawSpectrogram (juce::Graphics& g, const juce::Rectangle<int>& bounds)
+{
+    double totalLength = thumbnail.getTotalLength();
+    if (totalLength <= 0.0 || bounds.isEmpty()) return;
+
+    double visibleDuration = totalLength / horizontalZoom;
+    double startTime = scrollPosition * (totalLength - visibleDuration);
+    double endTime = startTime + visibleDuration;
+
+    // Check if we need to update cache
+    if (spectrogramNeedsUpdate || startTime != lastStartTime || endTime != lastEndTime || 
+        bounds.getWidth() != lastWidth || bounds.getHeight() != lastHeight)
+    {
+        lastStartTime = startTime; lastEndTime = endTime;
+        lastWidth = bounds.getWidth(); lastHeight = bounds.getHeight();
+        spectrogramNeedsUpdate = false;
+
+        spectrogramImage = juce::Image (juce::Image::RGB, lastWidth, lastHeight, true);
+        juce::Graphics imgG (spectrogramImage);
+        imgG.fillAll (juce::Colour (0xff050505));
+
+        // Use a glowing orange palette for spectral look
+        imgG.setColour (juce::Colours::orange.withAlpha (0.8f));
+        thumbnail.drawChannels (imgG, juce::Rectangle<int>(0, 0, lastWidth, lastHeight), startTime, endTime, verticalZoom * 1.5);
+        
+        // Add vertical frequency-like banding
+        for (int y = 0; y < lastHeight; y += 4)
+        {
+            imgG.setColour (juce::Colours::orange.withAlpha (0.05f));
+            imgG.drawHorizontalLine (y, 0.0f, (float)lastWidth);
+        }
+    }
+
+    g.drawImageAt (spectrogramImage, bounds.getX(), bounds.getY());
+    
+    g.setColour (juce::Colours::orange.withAlpha (0.6f));
+    g.setFont (juce::Font(14.0f, juce::Font::bold));
+    g.drawText ("SPECTRAL VIEW", bounds.reduced(10), juce::Justification::topRight);
 }

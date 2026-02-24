@@ -4,6 +4,8 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "WaveformDisplay.h"
 #include "CorrectionListView.h"
+#include "TrackListView.h"
+#include "UndoHistoryView.h"
 #include "SpectrogramDisplay.h"
 #include "ReaperLookAndFeel.h"
 #include "../Processors/BatchProcessor.h"
@@ -48,7 +50,7 @@ public:
     juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
     void getAllCommands (juce::Array<juce::CommandID>& commands) override;
     void getCommandInfo (juce::CommandID commandID, juce::ApplicationCommandInfo& result) override;
-    bool perform (const InvocationInfo& info) override;
+    bool perform (const juce::ApplicationCommandTarget::InvocationInfo& info) override;
 
     //==============================================================================
     // DocumentWindow overrides
@@ -87,9 +89,11 @@ private:
         fileClose,
         fileRecentClear,
         fileExit,
+        fileExitNoSave,
 
         editUndo,
         editRedo,
+        editMetadata,
         editSelectAll,
         editDeselect,
 
@@ -114,6 +118,7 @@ private:
         viewZoomFit,
         viewShowCorrectionList,
         viewShowSpectrogram,
+        viewToggleSpectral,
 
         transportPlay,
         transportPause,
@@ -121,6 +126,7 @@ private:
 
         optionsAudioSettings,
         optionsProcessingSettings,
+        optionsRecordingSettings,
         optionsAIDenoise,
 
         helpAbout,
@@ -180,12 +186,15 @@ private:
     float meterLevelLeft = 0.0f;
     float meterLevelRight = 0.0f;
     bool showCorrectionList = true;
+    bool showTrackList = true;
     bool quitAfterExport = false;
     juce::TooltipWindow tooltipWindow {this, 500};
     bool aiDenoiseEnabled = false;
 
     void showAudioSettings();
     void showProcessingSettings();
+    void showRecordingSettings();
+    void showMetadataEditor();
     void setUIScale (float newScale);
     void applyDenoiserSettings();
     void toggleRecording();
@@ -195,8 +204,18 @@ private:
     void setRecordingState (bool recording);
     void loadRecordingFromMemory (juce::MemoryBlock&& data);
 
-    //==============================================================================
-    // UI Scale
+    // Recording settings
+    juce::String recordingFormat = "WAV";
+    int recordingBitDepth = 24;
+    int recordingQuality = 2; // 0-3 for MP3/OGG
+    bool autoSaveRecordings = true;
+    float silenceThresholdDB = -40.0f;
+    float silenceDurationRequirement = 2.0f;
+
+    // Metadata for export
+    AudioFileManager::Metadata sessionMetadata;
+
+    // UI Scale factor
     float uiScaleFactor = 1.0f;
     int baseWidth = 1200;
     int baseHeight = 800;
@@ -212,9 +231,11 @@ private:
     NoiseReduction noiseReductionProcessor;
     FilterBank filterBankProcessor;
     TrackDetector trackDetector;
-    class DenoiseAudioSource;
-    std::unique_ptr<DenoiseAudioSource> denoiseSource;
+    class BufferAudioSource;
+    class RestorationAudioSource;
+    std::unique_ptr<juce::AudioSource> restorationSource;
     OnnxDenoiser realtimeDenoiser;
+    bool realtimeEqEnabled = true;
 
     //==============================================================================
     // Undo/Redo management
@@ -244,6 +265,7 @@ private:
     void openFileWithProgress (const juce::File& file);
     void finishFileLoad (const juce::File& file);
     void closeFile();
+    void updateTransportSourceFromBuffer (juce::int64 sampleOffset = 0);
     bool saveFile (const juce::File& file);
     void exportFile();
     bool promptToSaveIfNeeded (const juce::String& actionName);
@@ -310,7 +332,7 @@ class StandaloneWindow::MainComponent : public juce::Component,
                                         public juce::Slider::Listener
 {
 public:
-    MainComponent();
+    MainComponent (AudioUndoManager& undoMgr);
     ~MainComponent() override;
 
     void paint (juce::Graphics& g) override;
@@ -333,6 +355,8 @@ public:
     // Access to components
     WaveformDisplay& getWaveformDisplay() { return waveformDisplay; }
     CorrectionListView& getCorrectionListView() { return correctionListView; }
+    TrackListView& getTrackListView() { return trackListView; }
+    UndoHistoryView& getUndoHistoryView() { return undoHistoryView; }
     bool isLoopSelectionEnabled() const { return loopSelectionButton.getToggleState(); }
     
     juce::Button& getToolbarSpectrumButton() { return toolbarSpectrumButton; }
@@ -352,6 +376,9 @@ private:
     StandaloneWindow* parentWindow = nullptr;
     WaveformDisplay waveformDisplay;
     CorrectionListView correctionListView;
+    TrackListView trackListView;
+    UndoHistoryView undoHistoryView;
+    juce::TabbedComponent listTabs { juce::TabbedButtonBar::TabsAtTop };
 
     // Transport controls (retro cassette deck style)
     juce::TextButton rewindButton {"<<"};
@@ -359,15 +386,22 @@ private:
     juce::TextButton stopButton {"Stop"};
     juce::TextButton recordButton {"Rec"};
     juce::ToggleButton monitorButton {"Mon"};
+    juce::TextButton addMarkerButton {"+Track"};
+    juce::TextButton delMarkerButton {"-Track"};
     juce::TextButton forwardButton {">>"};
     juce::ToggleButton loopSelectionButton {"Loop Sel"};
     juce::TextButton zoomToSelectionButton {"Zoom Sel"};
     juce::Slider positionSlider;
     juce::Label timeLabel;
 
-    // Volume control
+    // Volume controls
     juce::Slider volumeSlider;
     juce::Label volumeLabel;
+    juce::Slider recordVolumeSlider;
+    juce::Label recordVolumeLabel;
+    juce::Slider monitorVolumeSlider;
+    juce::Label monitorVolumeLabel;
+
     class LedMeter : public juce::Component
     {
     public:
@@ -377,74 +411,14 @@ private:
             right = juce::jlimit (0.0f, 1.0f, rightLevel);
             repaint();
         }
-
-        void paint (juce::Graphics& g) override
-        {
-            auto bounds = getLocalBounds();
-            g.fillAll (juce::Colour (0xff1b1b1b));
-
-            const int segments = 12;
-            const int gap = 2;
-            int segmentHeight = (bounds.getHeight() - (segments - 1) * gap) / segments;
-            int litLeft = juce::roundToInt (left * segments);
-            int litRight = juce::roundToInt (right * segments);
-            int meterGap = 2;
-            int columnWidth = (bounds.getWidth() - meterGap) / 2;
-            auto leftBounds = bounds.withWidth (columnWidth);
-            auto rightBounds = bounds.withX (bounds.getX() + columnWidth + meterGap)
-                                   .withWidth (bounds.getWidth() - columnWidth - meterGap);
-
-            for (int i = 0; i < segments; ++i)
-            {
-                int y = bounds.getBottom() - (i + 1) * segmentHeight - i * gap;
-                juce::Rectangle<int> leftSegment (leftBounds.getX(), y, leftBounds.getWidth(), segmentHeight);
-                juce::Rectangle<int> rightSegment (rightBounds.getX(), y, rightBounds.getWidth(), segmentHeight);
-
-                bool litL = i < litLeft;
-                bool litR = i < litRight;
-
-                if (litL)
-                {
-                    if (i > 9)
-                        g.setColour (juce::Colours::red);
-                    else if (i > 7)
-                        g.setColour (juce::Colours::orange);
-                    else
-                        g.setColour (juce::Colours::green);
-                }
-                else
-                {
-                    g.setColour (juce::Colour (0xff2a2a2a));
-                }
-
-                g.fillRect (leftSegment);
-
-                if (litR)
-                {
-                    if (i > 9)
-                        g.setColour (juce::Colours::red);
-                    else if (i > 7)
-                        g.setColour (juce::Colours::orange);
-                    else
-                        g.setColour (juce::Colours::green);
-                }
-                else
-                {
-                    g.setColour (juce::Colour (0xff2a2a2a));
-                }
-
-                g.fillRect (rightSegment);
-            }
-
-            g.setColour (juce::Colour (0xff3a3a3a));
-            g.drawRect (bounds, 1);
-        }
-
     private:
-        float left = 0.0f;
-        float right = 0.0f;
+        float left = 0.0f, right = 0.0f;
+        void paint (juce::Graphics& g) override;
     };
+
     LedMeter volumeMeter;
+    LedMeter recordVolumeMeter;
+    LedMeter monitorVolumeMeter;
 
     // Zoom controls
     juce::TextButton zoomInButton {"+"};

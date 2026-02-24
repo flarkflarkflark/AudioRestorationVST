@@ -7,21 +7,6 @@
 
 namespace
 {
-    juce::File findExecutableInPath (const juce::String& exeName)
-    {
-        auto pathVar = juce::SystemStats::getEnvironmentVariable ("PATH", "");
-        juce::StringArray dirs;
-        dirs.addTokens (pathVar, ";", "");
-        dirs.removeEmptyStrings();
-        for (const auto& dir : dirs)
-        {
-            juce::File candidate = juce::File (dir).getChildFile (exeName);
-            if (candidate.existsAsFile())
-                return candidate;
-        }
-        return {};
-    }
-
     juce::File findFileUpwards (juce::File startDir, const juce::String& relativePath, int maxLevels)
     {
         if (!startDir.exists())
@@ -42,8 +27,40 @@ namespace
         return {};
     }
 
-    juce::File findFileNearApp (const juce::String& name)
+    juce::File findExecutableInPath (const juce::String& exeName)
     {
+        auto pathVar = juce::SystemStats::getEnvironmentVariable ("PATH", "");
+        juce::StringArray dirs;
+       #if JUCE_WINDOWS
+        dirs.addTokens (pathVar, ";", "");
+       #else
+        dirs.addTokens (pathVar, ":", "");
+       #endif
+        dirs.removeEmptyStrings();
+        
+        juce::String platformExeName = exeName;
+       #if JUCE_WINDOWS
+        if (!platformExeName.endsWithIgnoreCase (".exe"))
+            platformExeName += ".exe";
+       #endif
+
+        for (const auto& dir : dirs)
+        {
+            juce::File candidate = juce::File (dir).getChildFile (platformExeName);
+            if (candidate.existsAsFile())
+                return candidate;
+        }
+        return {};
+    }
+
+    juce::File findLibraryNearApp (const juce::String& name)
+    {
+        juce::String libName = name;
+       #if !JUCE_WINDOWS
+        if (libName.endsWith (".dll"))
+            libName = "lib" + libName.upToLastOccurrenceOf (".dll", false, false) + ".so";
+       #endif
+
         juce::Array<juce::File> dirs;
         auto execFile = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
         if (execFile.exists())
@@ -55,7 +72,7 @@ namespace
 
         for (const auto& dir : dirs)
         {
-            auto candidate = dir.getChildFile (name);
+            auto candidate = dir.getChildFile (libName);
             if (candidate.existsAsFile())
                 return candidate;
         }
@@ -74,28 +91,38 @@ namespace
 
     bool hasDmlProviderSupport()
     {
-        auto dmlProvider = findFileNearApp ("onnxruntime_providers_dml.dll");
+       #if !JUCE_WINDOWS
+        return false;
+       #endif
+        auto dmlProvider = findLibraryNearApp ("onnxruntime_providers_dml.dll");
         if (hasProviderSymbol (dmlProvider, "OrtSessionOptionsAppendExecutionProvider_DML"))
             return true;
 
-        auto sharedProvider = findFileNearApp ("onnxruntime_providers_shared.dll");
+        auto sharedProvider = findLibraryNearApp ("onnxruntime_providers_shared.dll");
         if (hasProviderSymbol (sharedProvider, "OrtSessionOptionsAppendExecutionProvider_DML"))
             return true;
 
-        auto coreRuntime = findFileNearApp ("onnxruntime.dll");
+        auto coreRuntime = findLibraryNearApp ("onnxruntime.dll");
         return hasProviderSymbol (coreRuntime, "OrtSessionOptionsAppendExecutionProvider_DML");
     }
 
     juce::File findInstallScript()
     {
+        juce::String scriptName = 
+           #if JUCE_WINDOWS
+            "install_vcpkg_mp3.ps1";
+           #else
+            "install_linux_deps.sh";
+           #endif
+
         auto cwd = juce::File::getCurrentWorkingDirectory();
-        auto candidate = cwd.getChildFile ("tools").getChildFile ("install_vcpkg_mp3.ps1");
+        auto candidate = cwd.getChildFile ("tools").getChildFile (scriptName);
         if (candidate.existsAsFile())
             return candidate;
 
         auto execFile = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
         auto baseDir = execFile.isDirectory() ? execFile : execFile.getParentDirectory();
-        return findFileUpwards (baseDir, "tools/install_vcpkg_mp3.ps1", 6);
+        return findFileUpwards (baseDir, "tools/" + scriptName, 6);
     }
 
     juce::String formatStatus (const juce::String& name, bool ok)
@@ -282,10 +309,15 @@ SettingsComponent::SettingsComponent (ApplyCallback onApplyCallback,
     depsPanel.addAndMakeVisible (onnxStatusLabel);
     mp3StatusLabel.setText ("MP3: -", juce::dontSendNotification);
     depsPanel.addAndMakeVisible (mp3StatusLabel);
+    
+   #if JUCE_WINDOWS
     vcpkgStatusLabel.setText ("vcpkg: -", juce::dontSendNotification);
     depsPanel.addAndMakeVisible (vcpkgStatusLabel);
 
     depsHintLabel.setText ("Use vcpkg to install LAME/mpg123. ONNX providers must be next to the binary.", juce::dontSendNotification);
+   #else
+    depsHintLabel.setText ("Install LAME and mpg123 via your package manager. ONNX libraries must be in the app folder or /usr/lib.", juce::dontSendNotification);
+   #endif
     depsHintLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
     depsPanel.addAndMakeVisible (depsHintLabel);
 
@@ -293,6 +325,13 @@ SettingsComponent::SettingsComponent (ApplyCallback onApplyCallback,
     depsPanel.addAndMakeVisible (refreshDepsButton);
 
     installMp3Button.addListener (this);
+    installMp3Button.setButtonText (
+       #if JUCE_WINDOWS
+        "Install MP3 (vcpkg)"
+       #else
+        "Install Dependencies"
+       #endif
+    );
     depsPanel.addAndMakeVisible (installMp3Button);
     installMp3Button.setEnabled (allowInstallActions);
 
@@ -454,6 +493,7 @@ void SettingsComponent::buttonClicked (juce::Button* button)
     }
     else if (button == &installMp3Button)
     {
+       #if JUCE_WINDOWS
         if (!allowInstallActions)
         {
             juce::AlertWindow::showMessageBoxAsync (
@@ -507,6 +547,31 @@ void SettingsComponent::buttonClicked (juce::Button* button)
             juce::AlertWindow::InfoIcon,
             "Install MP3 Dependencies",
             "Installer started in background. Re-run 'Check Dependencies' when finished.");
+       #else
+        juce::String message = "To install missing dependencies on Linux, run:\n\n"
+                               "Ubuntu/Debian:\nsudo apt install lame libmpg123-dev\n\n"
+                               "Arch Linux:\nsudo pacman -S lame mpg123\n\n"
+                               "Fedora:\nsudo dnf install lame mpg123-devel";
+        
+        auto script = findInstallScript();
+        if (script.existsAsFile())
+        {
+            juce::ChildProcess proc;
+            if (proc.start ("bash \"" + script.getFullPathName() + "\""))
+            {
+                juce::AlertWindow::showMessageBoxAsync (
+                    juce::AlertWindow::InfoIcon,
+                    "Installing Dependencies",
+                    "Installation script started in background.\n\n" + message);
+                return;
+            }
+        }
+
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::AlertWindow::InfoIcon,
+            "Install Dependencies",
+            message);
+       #endif
     }
     else if (button == &resetButton)
     {
@@ -558,8 +623,17 @@ void SettingsComponent::saveToSettings()
 
 void SettingsComponent::refreshDependencyStatus()
 {
-    auto ortQnn = findFileNearApp ("onnxruntime_providers_qnn.dll");
-    auto ortCore = findFileNearApp ("onnxruntime.dll");
+    auto ortQnn = findLibraryNearApp ("onnxruntime_providers_qnn.dll");
+    auto ortCore = findLibraryNearApp ("onnxruntime.dll");
+    
+    // Also check system paths on Linux
+   #if !JUCE_WINDOWS
+    if (!ortCore.existsAsFile())
+        ortCore = juce::File ("/usr/lib/libonnxruntime.so");
+    if (!ortCore.existsAsFile())
+        ortCore = juce::File ("/usr/local/lib/libonnxruntime.so");
+   #endif
+
     auto dmlAvailable = hasDmlProviderSupport();
     auto qnnBackendPath = SettingsManager::getInstance().getDenoiseSettings().qnnBackendPath;
     if (qnnBackendPath.isEmpty())
@@ -573,7 +647,13 @@ void SettingsComponent::refreshDependencyStatus()
         qnnBackendOk = backendFile.existsAsFile();
         if (!qnnProviderOk && backendFile.existsAsFile())
         {
-            auto providerFromBackend = backendFile.getParentDirectory().getChildFile ("onnxruntime_providers_qnn.dll");
+            auto providerFromBackend = backendFile.getParentDirectory().getChildFile (
+               #if JUCE_WINDOWS
+                "onnxruntime_providers_qnn.dll"
+               #else
+                "libonnxruntime_providers_qnn.so"
+               #endif
+            );
             qnnProviderOk = providerFromBackend.existsAsFile();
         }
     }
@@ -614,6 +694,7 @@ void SettingsComponent::refreshDependencyStatus()
 
     mp3StatusLabel.setText (mp3Status, juce::dontSendNotification);
 
+   #if JUCE_WINDOWS
     auto vcpkgRoot = juce::SystemStats::getEnvironmentVariable ("VCPKG_ROOT", "");
     auto vcpkgExe = findExecutableInPath ("vcpkg.exe");
     if (!vcpkgExe.existsAsFile())
@@ -630,6 +711,7 @@ void SettingsComponent::refreshDependencyStatus()
     else
         vcpkgStatus += "Not found";
     vcpkgStatusLabel.setText (vcpkgStatus, juce::dontSendNotification);
+   #endif
 
     refreshDmlDeviceList();
 }

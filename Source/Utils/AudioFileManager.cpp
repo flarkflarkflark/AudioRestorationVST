@@ -241,6 +241,58 @@ bool AudioFileManager::saveAudioFile (const juce::File& file,
     return success;
 }
 
+bool AudioFileManager::saveAudioFileWithMetadata (const juce::File& file,
+                                                const juce::AudioBuffer<float>& buffer,
+                                                double sampleRate,
+                                                int bitDepth,
+                                                const Metadata& metadata,
+                                                int quality)
+{
+    if (buffer.getNumSamples() == 0) return false;
+
+    if (file.existsAsFile()) file.deleteFile();
+
+    auto outputStream = std::unique_ptr<juce::FileOutputStream> (file.createOutputStream());
+    if (outputStream == nullptr) return false;
+
+    juce::WavAudioFormat wavFormat;
+    juce::FlacAudioFormat flacFormat;
+    juce::OggVorbisAudioFormat oggFormat;
+    #if USE_LAME || USE_MPG123
+    LameMP3AudioFormat mp3Format;
+    #endif
+
+    juce::AudioFormat* format = nullptr;
+    juce::String extension = file.getFileExtension().toLowerCase();
+
+    if (extension == ".wav") format = &wavFormat;
+    else if (extension == ".flac") format = &flacFormat;
+    else if (extension == ".ogg") format = &oggFormat;
+    #if USE_LAME
+    else if (extension == ".mp3") format = &mp3Format;
+    #endif
+    
+    if (format == nullptr) return false;
+
+    juce::StringPairArray metadataMap;
+    if (metadata.title.isNotEmpty()) metadataMap.set ("title", metadata.title);
+    if (metadata.artist.isNotEmpty()) metadataMap.set ("artist", metadata.artist);
+    if (metadata.album.isNotEmpty()) metadataMap.set ("album", metadata.album);
+    if (metadata.comment.isNotEmpty()) metadataMap.set ("comment", metadata.comment);
+    if (metadata.year.isNotEmpty()) metadataMap.set ("date", metadata.year);
+    if (metadata.trackNumber.isNotEmpty()) metadataMap.set ("track", metadata.trackNumber);
+    if (metadata.genre.isNotEmpty()) metadataMap.set ("genre", metadata.genre);
+
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        format->createWriterFor (outputStream.release(), sampleRate, 
+                                (unsigned int)buffer.getNumChannels(), bitDepth, 
+                                metadataMap, quality));
+
+    if (writer == nullptr) return false;
+
+    return writer->writeFromAudioSampleBuffer (buffer, 0, buffer.getNumSamples());
+}
+
 bool AudioFileManager::saveSession (const juce::File& sessionFile,
                                     const juce::File& audioFile,
                                     const juce::var& sessionData)

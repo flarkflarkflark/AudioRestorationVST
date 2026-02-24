@@ -40,6 +40,25 @@ public:
                         double sampleRate,
                         int bitDepth = 16);
 
+    struct Metadata
+    {
+        juce::String title;
+        juce::String artist;
+        juce::String album;
+        juce::String comment;
+        juce::String year;
+        juce::String trackNumber;
+        juce::String genre;
+    };
+
+    /** Save audio file with metadata (ID3 tags for MP3) */
+    bool saveAudioFileWithMetadata (const juce::File& file,
+                                    const juce::AudioBuffer<float>& buffer,
+                                    double sampleRate,
+                                    int bitDepth,
+                                    const Metadata& metadata,
+                                    int quality = 3);
+
     //==============================================================================
     /** Save session file (corrections, settings) as JSON */
     bool saveSession (const juce::File& sessionFile,

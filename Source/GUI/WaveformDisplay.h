@@ -43,6 +43,9 @@ public:
     /** Update waveform from an audio buffer (after processing) */
     void updateFromBuffer (const juce::AudioBuffer<float>& buffer, double sampleRate);
 
+    /** Prepare the thumbnail for a new recording */
+    void prepareForRecording (double sampleRate, int numChannels);
+
     /** Add a block of samples to the thumbnail (for real-time recording view) */
     void addBlock (const float** channelData, int numChannels, int numSamples);
 
@@ -85,7 +88,10 @@ public:
         actionDeleteSelection = 203,
         actionCropToSelection = 204,
         actionSelectAll = 205,
-        actionPlaySelection = 206
+        actionPlaySelection = 206,
+        actionAddTrackMarker = 207,
+        actionFadeIn = 208,
+        actionFadeOut = 209
     };
 
     /** Check if there's data in clipboard for paste operation */
@@ -110,6 +116,7 @@ public:
     double horizontalZoom = 1.0; // Zoom multiplier (1.0 = fit all, >1 = zoomed in)
     double verticalZoom = 1.0;
     double scrollPosition = 0.0; // Position in file (0.0 to 1.0)
+    bool showSpectralView = false;
 
     //==============================================================================
     // Selection management
@@ -133,11 +140,18 @@ public:
 
 private:
     void drawWaveform (juce::Graphics& g, const juce::Rectangle<int>& bounds);
+    void drawSpectrogram (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawTimeRuler (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawClickMarkers (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawPlaybackCursor (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void drawSelection (juce::Graphics& g, const juce::Rectangle<int>& bounds);
     void showContextMenu (const juce::MouseEvent& event);
+
+    // Spectrogram cache
+    juce::Image spectrogramImage;
+    bool spectrogramNeedsUpdate = true;
+    double lastStartTime = -1.0, lastEndTime = -1.0;
+    int lastWidth = -1, lastHeight = -1;
 
     //==============================================================================
     juce::AudioFormatManager formatManager;

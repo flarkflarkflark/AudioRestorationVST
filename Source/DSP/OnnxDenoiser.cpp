@@ -258,28 +258,26 @@ bool OnnxDenoiser::loadDefaultModelIfNeeded()
         return true;
 
     const auto providers = getProviderFallbackOrder();
-    if (modelPath.existsAsFile())
-    {
-        for (const auto provider : providers)
-        {
-            if (!isProviderUsable (provider))
-                continue;
+    const auto candidates = getModelCandidates();
 
+    // Strategy: For each provider in fallback order, try all model candidates
+    // This is more robust than trying each model for all providers
+    for (const auto provider : providers)
+    {
+        if (!isProviderUsable (provider))
+            continue;
+
+        // If user set a specific path, try that first for this provider
+        if (modelPath.existsAsFile())
+        {
             if (tryCreateSessionForProvider (modelPath, provider))
                 return true;
         }
-    }
 
-    const auto candidates = getModelCandidates();
-
-    for (const auto& candidate : candidates)
-    {
-        if (!candidate.existsAsFile())
-            continue;
-
-        for (const auto provider : providers)
+        // Try all discovery candidates
+        for (const auto& candidate : candidates)
         {
-            if (!isProviderUsable (provider))
+            if (!candidate.existsAsFile())
                 continue;
 
             if (tryCreateSessionForProvider (candidate, provider))
@@ -290,6 +288,7 @@ bool OnnxDenoiser::loadDefaultModelIfNeeded()
         }
     }
 
+    DBG ("OnnxDenoiser: Failed to load any model with any available provider.");
     return false;
 }
 
@@ -402,9 +401,14 @@ bool OnnxDenoiser::runModel (const float* input, float* output, int frameSize)
 bool OnnxDenoiser::tryCreateSessionForProvider (const juce::File& file, Provider provider)
 {
     if (!file.existsAsFile())
+    {
+        DBG ("OnnxDenoiser: Model file not found: " + file.getFullPathName());
         return false;
+    }
 
     session.reset();
+    juce::String providerName = providerToString (provider);
+    DBG ("OnnxDenoiser: Attempting to create session for provider " + providerName + " using " + file.getFileName());
 
     try
     {
@@ -463,7 +467,10 @@ bool OnnxDenoiser::tryCreateSessionForProvider (const juce::File& file, Provider
         }
 
         if (!providerReady)
+        {
+            DBG ("OnnxDenoiser: Provider " + providerName + " not supported or not ready.");
             return false;
+        }
 
        #if JUCE_WINDOWS
         auto filePath = file.getFullPathName();
@@ -472,18 +479,42 @@ bool OnnxDenoiser::tryCreateSessionForProvider (const juce::File& file, Provider
         session = std::make_unique<Ort::Session> (env, file.getFullPathName().toRawUTF8(), sessionOptions);
        #endif
 
+        if (session == nullptr)
+        {
+            DBG ("OnnxDenoiser: Session creation returned null for " + providerName);
+            return false;
+        }
+
         Ort::AllocatorWithDefaultOptions allocator;
-        inputName = session->GetInputNameAllocated (0, allocator).get();
-        outputName = session->GetOutputNameAllocated (0, allocator).get();
+        auto inputAllocated = session->GetInputNameAllocated (0, allocator);
+        auto outputAllocated = session->GetOutputNameAllocated (0, allocator);
+        
+        inputName = inputAllocated.get();
+        outputName = outputAllocated.get();
+
+        if (inputName.empty() || outputName.empty())
+        {
+            DBG ("OnnxDenoiser: Failed to retrieve input/output names from model.");
+            session.reset();
+            return false;
+        }
 
         auto inputTypeInfo = session->GetInputTypeInfo (0);
         auto tensorInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
         modelInputShape = tensorInfo.GetShape();
 
         activeProvider = provider;
+        DBG ("OnnxDenoiser: Successfully created session for " + providerName);
+    }
+    catch (const std::exception& e)
+    {
+        DBG ("OnnxDenoiser: Exception during session creation for " + providerName + ": " + e.what());
+        session.reset();
+        return false;
     }
     catch (...)
     {
+        DBG ("OnnxDenoiser: Unknown exception during session creation for " + providerName);
         session.reset();
         return false;
     }
@@ -578,7 +609,7 @@ std::vector<juce::File> OnnxDenoiser::getModelCandidates() const
             case Provider::cuda: filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive_cuda.onnx"); break;
             case Provider::rocm: filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive_rocm.onnx"); break;
             case Provider::coreml: filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive_coreml.onnx"); break;
-            case Provider::cpu: break;
+            case Provider::cpu: filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive_cpu.onnx"); break;
             case Provider::autoSelect: break;
         }
     };
@@ -590,12 +621,14 @@ std::vector<juce::File> OnnxDenoiser::getModelCandidates() const
         addByProvider (Provider::cuda);
         addByProvider (Provider::rocm);
         addByProvider (Provider::coreml);
+        addByProvider (Provider::cpu);
     }
     else
     {
         addByProvider (preferredProvider);
     }
 
+    filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive.onnx");
     filenamePriority.addIfNotAlreadyThere ("rnnoise_48k_olive_cpu.onnx");
     filenamePriority.addIfNotAlreadyThere ("rnnoise_48k.onnx");
 
@@ -603,8 +636,14 @@ std::vector<juce::File> OnnxDenoiser::getModelCandidates() const
     {
         juce::File modelDir (dir);
         auto candidateDir = modelDir.getChildFile ("models");
+        DBG ("OnnxDenoiser: Searching for models in: " + candidateDir.getFullPathName());
         for (const auto& filename : filenamePriority)
-            candidates.push_back (candidateDir.getChildFile (filename));
+        {
+            auto candidateFile = candidateDir.getChildFile (filename);
+            if (candidateFile.existsAsFile())
+                DBG ("OnnxDenoiser: Found model candidate: " + candidateFile.getFullPathName());
+            candidates.push_back (candidateFile);
+        }
     }
 
     return candidates;

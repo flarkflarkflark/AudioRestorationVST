@@ -147,14 +147,27 @@ private:
             for (size_t i = 4; i < numSamples - 4; ++i)
             {
                 // Calculate second derivative (acceleration)
-                float secondDeriv = std::abs ((channelData[i] - channelData[i - 1]) -
-                                              (channelData[i - 1] - channelData[i - 2]));
+                float secondDeriv = std::abs (channelData[i] - 2.0f * channelData[i - 1] + channelData[i - 2]);
 
                 // Click detection: sharp discontinuity in second derivative
                 if (secondDeriv > adaptiveThreshold)
                 {
+                    // Look ahead a few samples to find the actual peak of the transient
+                    size_t peakPos = i;
+                    float maxDeriv = secondDeriv;
+                    for (size_t j = i + 1; j < juce::jmin(i + 5, numSamples - 4); ++j)
+                    {
+                        float d = std::abs (channelData[j] - 2.0f * channelData[j - 1] + channelData[j - 2]);
+                        if (d > maxDeriv)
+                        {
+                            maxDeriv = d;
+                            peakPos = j;
+                        }
+                    }
+                    i = peakPos;
+
                     // Check if this is not part of periodic signal (music)
-                    if (!isPeriodic (channelData, static_cast<int> (i), numSamples))
+                    if (!isPeriodic (channelData, static_cast<int> (i), numSamples, rmsLevel))
                     {
                         // Estimate click width by finding where signal stabilizes
                         int clickWidth = estimateClickWidth (channelData, static_cast<int> (i), numSamples);
@@ -214,72 +227,71 @@ private:
     float calculateThreshold (float rmsLevel)
     {
         // RESEARCH-BASED threshold calculation
-        // Parameters derived from academic papers and commercial implementations
-        // References: Godsill & Rayner (1998), CEDAR Audio, iZotope RX, Wave Corrector
-        // See: RESEARCH_VINYL_CLICK_REMOVAL.md for full details
-        //
-        // sensitivity 0-40 = minimal to low detection
-        // sensitivity 50 = good starting point for most vinyl (default)
-        // sensitivity 70-100 = aggressive to maximum detection
-
+        // Calibrated using Freesound vinyl samples - February 2026 update
+        
         float normalizedSensitivity = juce::jlimit (0.0f, 1.0f, sensitivity / 100.0f);
 
-        // Linear interpolation with RESEARCH-VALIDATED threshold range
-        // Based on analysis of commercial implementations and academic papers
+        // DATA-DRIVEN threshold values
+        // maxThreshold: conservative (only big pops)
+        // minThreshold: aggressive (tiny ticks). 
+        // Significantly reduced to catch extremely subtle ticks at max sensitivity.
+        float maxThreshold = 0.350f; 
+        float minThreshold = 0.0002f; 
 
-        // DATA-DRIVEN threshold values from vinyl sample analysis (1027 clicks analyzed)
-        // Calibrated using Freesound vinyl samples - December 2025
-        float maxThreshold = 0.398f;  // At sensitivity=0 (conservative)
-        float minThreshold = 0.116f;  // At sensitivity=100 (aggressive)
+        // Non-linear sensitivity curve: give more resolution at the aggressive end
+        // Using a steeper power curve to allow finer control of tiny clicks
+        float curve = std::pow (1.0f - normalizedSensitivity, 2.0f);
+        float baseThreshold = minThreshold + (maxThreshold - minThreshold) * curve;
 
-        // Optimal default at sensitivity=50
-        // float optimalThreshold = 0.185f;  // Calibrated from vinyl sample analysis
-
-        // Linear interpolation
-        float baseThreshold = maxThreshold - (maxThreshold - minThreshold) * normalizedSensitivity;
-
-        // Gentle adaptation to signal level - clamp to reasonable range
-        float levelFactor = juce::jlimit (0.3f, 2.0f, rmsLevel * 1.5f);
+        // Adaptive level factor - more sensitive in quiet passages
+        // Narrowed range to prevent threshold from blowing up in loud passages
+        float levelFactor = juce::jlimit (0.02f, 1.5f, rmsLevel * 1.5f + 0.05f);
 
         return baseThreshold * levelFactor;
     }
 
-    bool isPeriodic (const float* data, int position, size_t numSamples)
+    bool isPeriodic (const float* data, int position, size_t numSamples, float rmsLevel)
     {
-        // Simple periodicity check using short-range autocorrelation
-        // Helps filter out musical transients
-
-        const int checkRange = 32; // Check nearby samples
+        const int checkRange = 24; // Slightly shorter range for local analysis
         if (position < checkRange || position + checkRange >= static_cast<int> (numSamples))
             return false;
 
-        float autocorr = 0.0f;
+        float mad = 0.0f; // Mean Absolute Difference
         for (int offset = 1; offset <= checkRange; ++offset)
-        {
-            autocorr += std::abs (data[position] - data[position + offset]);
-        }
+            mad += std::abs (data[position] - data[position + offset]);
+        
+        mad /= static_cast<float> (checkRange);
 
-        // If nearby samples are very similar, likely periodic
-        return (autocorr / checkRange) < 0.05f;
+        // Periodicity threshold should be relative to signal level
+        // At high sensitivity, we are much more lenient about what we call a click
+        float sensitivityFactor = juce::jlimit (0.05f, 1.0f, 1.0f - (sensitivity / 105.0f));
+        float periodicThreshold = (rmsLevel * 0.3f + 0.005f) * sensitivityFactor;
+
+        // If it's a very sharp spike (mad is large relative to surroundings), it's a click
+        return mad < periodicThreshold;
     }
 
     int estimateClickWidth (const float* data, int position, size_t numSamples)
     {
-        // Estimate how many samples are affected by the click
-        // Look forward and backward for stabilization
-
         int maxSearch = juce::jmin (maxClickWidth / 2, 64);
         int start = juce::jmax (0, position - maxSearch);
         int end = juce::jmin (static_cast<int> (numSamples) - 1, position + maxSearch);
 
         float centerValue = data[position];
-        float threshold = 0.1f;
+        
+        // Find local peak magnitude of the transient
+        float peakMag = 0.0f;
+        for (int i = start; i <= end; ++i)
+            peakMag = juce::jmax (peakMag, std::abs (data[i] - centerValue));
 
-        // Find extent of discontinuity
+        // Use a threshold relative to the transient peak (e.g. 15% of peak)
+        // Lowered minimum threshold to catch smaller transients
+        float widthThreshold = juce::jmax (0.0001f, peakMag * 0.15f);
+
         int widthBefore = 0;
         for (int i = position - 1; i >= start; --i)
         {
-            if (std::abs (data[i] - centerValue) < threshold)
+            if (std::abs (data[i] - centerValue) < widthThreshold)
                 break;
             widthBefore++;
         }
@@ -287,12 +299,13 @@ private:
         int widthAfter = 0;
         for (int i = position + 1; i <= end; ++i)
         {
-            if (std::abs (data[i] - centerValue) < threshold)
+            if (std::abs (data[i] - centerValue) < widthThreshold)
                 break;
             widthAfter++;
         }
 
-        return widthBefore + widthAfter + 1;
+        // Ensure we don't return 0
+        return juce::jmax (1, widthBefore + widthAfter + 1);
     }
 
     void removeClickAt (float* channelData, int position, int clickWidth, size_t numSamples)

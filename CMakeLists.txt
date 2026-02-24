@@ -4,7 +4,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(VinylRestorationSuite VERSION 1.6.23)
+project(VinylRestorationSuite VERSION 1.6.30)
 
 # Add JUCE as a subdirectory (using local submodule)
 add_subdirectory(JUCE)
@@ -440,6 +440,8 @@ set(SOURCE_FILES
     Source/DSP/SpectralProcessor.cpp
     Source/GUI/WaveformDisplay.cpp
     Source/GUI/CorrectionListView.cpp
+    Source/GUI/TrackListView.cpp
+    Source/GUI/UndoHistoryView.cpp
     Source/GUI/SettingsComponent.cpp
     Source/GUI/StandaloneWindow.cpp
     Source/GUI/SpectrogramDisplay.cpp
@@ -462,6 +464,8 @@ set(HEADER_FILES
     Source/DSP/SpectralProcessor.h
     Source/GUI/WaveformDisplay.h
     Source/GUI/CorrectionListView.h
+    Source/GUI/TrackListView.h
+    Source/GUI/UndoHistoryView.h
     Source/GUI/SettingsComponent.h
     Source/GUI/StandaloneWindow.h
     Source/GUI/SpectrogramDisplay.h
@@ -481,7 +485,7 @@ option(VRS_COPY_PLUGIN_AFTER_BUILD "Copy VST3 to system folder after build" OFF)
 
 # Add the plugin target (VST3 only)
 juce_add_plugin(VinylRestorationSuite
-    PRODUCT_NAME "Vinyl Restoration Suite v1.6.23"
+    PRODUCT_NAME "Vinyl Restoration Suite v1.6.27"
     COMPANY_NAME "flarkAUDIO"
     PLUGIN_MANUFACTURER_CODE Flrk
     PLUGIN_CODE Vrs1
@@ -564,6 +568,8 @@ target_sources(VinylRestorationSuiteStandalone PRIVATE
     Source/DSP/SpectralProcessor.cpp
     Source/GUI/WaveformDisplay.cpp
     Source/GUI/CorrectionListView.cpp
+    Source/GUI/TrackListView.cpp
+    Source/GUI/UndoHistoryView.cpp
     Source/GUI/SettingsComponent.cpp
     Source/GUI/StandaloneWindow.cpp
     Source/GUI/SpectrogramDisplay.cpp
@@ -581,6 +587,8 @@ target_sources(VinylRestorationSuiteStandalone PRIVATE
     Source/DSP/SpectralProcessor.h
     Source/GUI/WaveformDisplay.h
     Source/GUI/CorrectionListView.h
+    Source/GUI/TrackListView.h
+    Source/GUI/UndoHistoryView.h
     Source/GUI/SettingsComponent.h
     Source/GUI/StandaloneWindow.h
     Source/GUI/SpectrogramDisplay.h
