@@ -18,11 +18,16 @@
  */
 class WaveformDisplay : public juce::Component,
                         public juce::ChangeListener,
-                        public juce::Timer
+                        public juce::Timer,
+                        public juce::FileDragAndDropTarget
 {
 public:
     WaveformDisplay();
     ~WaveformDisplay() override;
+
+    // FileDragAndDropTarget overrides
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
 
     //==============================================================================
     /** Load audio file into waveform display */
@@ -43,6 +48,9 @@ public:
     /** Update waveform from an audio buffer (after processing) */
     void updateFromBuffer (const juce::AudioBuffer<float>& buffer, double sampleRate);
 
+    /** Link the main audio buffer for spectral analysis */
+    void setAudioBuffer (const juce::AudioBuffer<float>* buffer) { mainAudioBuffer = buffer; spectrogramNeedsUpdate = true; }
+
     /** Prepare the thumbnail for a new recording */
     void prepareForRecording (double sampleRate, int numChannels);
 
@@ -60,6 +68,9 @@ public:
 
     /** Set callback for when selection changes */
     std::function<void(int64_t start, int64_t end)> onSelectionChanged;
+
+    /** Set callback for when a file is dropped onto the display */
+    std::function<void(const juce::File&)> onFileDropped;
 
     /** Zoom view to current selection */
     bool zoomToSelection();
@@ -196,6 +207,8 @@ private:
     // Clipboard buffer for cut/copy/paste
     juce::AudioBuffer<float> clipboardBuffer;
     double clipboardSampleRate = 44100.0;
+
+    const juce::AudioBuffer<float>* mainAudioBuffer = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (WaveformDisplay)
 };

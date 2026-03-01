@@ -32,13 +32,10 @@ int UndoHistoryView::getNumRows()
 
 void UndoHistoryView::paintListBoxItem (int rowNumber, juce::Graphics& g, int width, int height, bool rowIsSelected)
 {
-    int numStates = undoManager.getNumUndoStates();
-    if (rowNumber >= numStates) return;
+    auto history = undoManager.getUndoHistory();
+    if (rowNumber >= history.size()) return;
 
-    // Row 0 is the newest state
-    juce::String desc = undoManager.getUndoDescription(); 
-    // Opmerking: AudioUndoManager moet worden uitgebreid om individuele beschrijvingen op te halen.
-    // Voor nu tonen we een generieke lijst.
+    juce::String desc = history[rowNumber];
     
     if (rowIsSelected)
         g.fillAll (juce::Colours::darkred.withAlpha (0.4f));
@@ -46,7 +43,7 @@ void UndoHistoryView::paintListBoxItem (int rowNumber, juce::Graphics& g, int wi
     g.setColour (juce::Colours::white);
     g.setFont (14.0f);
     
-    juce::String text = juce::String (numStates - rowNumber) + ". Undo State";
+    juce::String text = juce::String (history.size() - rowNumber) + ". " + desc;
     g.drawText (text, 10, 0, width - 20, height, juce::Justification::centredLeft);
 }
 

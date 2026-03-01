@@ -239,8 +239,10 @@ SettingsComponent::SettingsComponent (ApplyCallback onApplyCallback,
     providerEntries = {
         { "Auto (best available)", OnnxDenoiser::Provider::autoSelect },
         { "CPU", OnnxDenoiser::Provider::cpu },
+#if JUCE_WINDOWS
         { "DirectML (GPU/NPU)", OnnxDenoiser::Provider::dml },
         { "QNN (NPU)", OnnxDenoiser::Provider::qnn },
+#endif
         { "CUDA", OnnxDenoiser::Provider::cuda },
         { "ROCM", OnnxDenoiser::Provider::rocm },
         { "CoreML", OnnxDenoiser::Provider::coreml }
@@ -623,18 +625,22 @@ void SettingsComponent::saveToSettings()
 
 void SettingsComponent::refreshDependencyStatus()
 {
-    auto ortQnn = findLibraryNearApp ("onnxruntime_providers_qnn.dll");
+   #if JUCE_WINDOWS
     auto ortCore = findLibraryNearApp ("onnxruntime.dll");
-    
+   #else
+    auto ortCore = findLibraryNearApp ("libonnxruntime.so");
     // Also check system paths on Linux
-   #if !JUCE_WINDOWS
     if (!ortCore.existsAsFile())
         ortCore = juce::File ("/usr/lib/libonnxruntime.so");
     if (!ortCore.existsAsFile())
         ortCore = juce::File ("/usr/local/lib/libonnxruntime.so");
    #endif
 
+    juce::String statusText = "ONNX Runtime: " + juce::String (ortCore.existsAsFile() ? "OK" : "Missing");
+
+   #if JUCE_WINDOWS
     auto dmlAvailable = hasDmlProviderSupport();
+    auto ortQnn = findLibraryNearApp ("onnxruntime_providers_qnn.dll");
     auto qnnBackendPath = SettingsManager::getInstance().getDenoiseSettings().qnnBackendPath;
     if (qnnBackendPath.isEmpty())
         qnnBackendPath = juce::SystemStats::getEnvironmentVariable ("VRS_QNN_BACKEND_PATH", "");
@@ -647,13 +653,7 @@ void SettingsComponent::refreshDependencyStatus()
         qnnBackendOk = backendFile.existsAsFile();
         if (!qnnProviderOk && backendFile.existsAsFile())
         {
-            auto providerFromBackend = backendFile.getParentDirectory().getChildFile (
-               #if JUCE_WINDOWS
-                "onnxruntime_providers_qnn.dll"
-               #else
-                "libonnxruntime_providers_qnn.so"
-               #endif
-            );
+            auto providerFromBackend = backendFile.getParentDirectory().getChildFile ("onnxruntime_providers_qnn.dll");
             qnnProviderOk = providerFromBackend.existsAsFile();
         }
     }
@@ -668,11 +668,23 @@ void SettingsComponent::refreshDependencyStatus()
     else
         qnnStatus = "Missing";
 
-    onnxStatusLabel.setText (
-        "ONNX Runtime: " + juce::String (ortCore.existsAsFile() ? "OK" : "Missing") +
-            ", DML: " + juce::String (dmlAvailable ? "OK" : "Missing") +
-            ", QNN: " + qnnStatus,
-        juce::dontSendNotification);
+    statusText += ", DML: " + juce::String (dmlAvailable ? "OK" : "Missing") +
+                  ", QNN: " + qnnStatus;
+   #else
+    // On Linux/Mac, check for ROCm and CUDA instead
+    juce::File ortRocm ("/usr/lib/libonnxruntime_providers_rocm.so");
+    if (!ortRocm.existsAsFile()) ortRocm = juce::File ("/usr/local/lib/libonnxruntime_providers_rocm.so");
+    if (!ortRocm.existsAsFile()) ortRocm = findLibraryNearApp ("libonnxruntime_providers_rocm.so");
+    
+    juce::File ortCuda ("/usr/lib/libonnxruntime_providers_cuda.so");
+    if (!ortCuda.existsAsFile()) ortCuda = juce::File ("/usr/local/lib/libonnxruntime_providers_cuda.so");
+    if (!ortCuda.existsAsFile()) ortCuda = findLibraryNearApp ("libonnxruntime_providers_cuda.so");
+
+    statusText += ", ROCm: " + juce::String (ortRocm.existsAsFile() ? "OK" : "Missing") +
+                  ", CUDA: " + juce::String (ortCuda.existsAsFile() ? "OK" : "Missing");
+   #endif
+
+    onnxStatusLabel.setText (statusText, juce::dontSendNotification);
 
    #if defined(USE_LAME) || defined(USE_MPG123)
     juce::String mp3Status = "MP3 support: Enabled (";

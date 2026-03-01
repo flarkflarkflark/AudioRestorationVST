@@ -6,6 +6,10 @@ endif()
 
 project(VinylRestorationSuite VERSION 1.6.30)
 
+if(APPLE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "macOS Deployment Target (Ventura)")
+endif()
+
 # Add JUCE as a subdirectory (using local submodule)
 add_subdirectory(JUCE)
 
@@ -485,7 +489,7 @@ option(VRS_COPY_PLUGIN_AFTER_BUILD "Copy VST3 to system folder after build" OFF)
 
 # Add the plugin target (VST3 only)
 juce_add_plugin(VinylRestorationSuite
-    PRODUCT_NAME "Vinyl Restoration Suite v1.6.27"
+    PRODUCT_NAME "Vinyl Restoration Suite v${PROJECT_VERSION}"
     COMPANY_NAME "flarkAUDIO"
     PLUGIN_MANUFACTURER_CODE Flrk
     PLUGIN_CODE Vrs1
@@ -555,6 +559,8 @@ endif()
 juce_add_gui_app(VinylRestorationSuiteStandalone
     PRODUCT_NAME "Vinyl Restoration Suite"
     COMPANY_NAME "flarkAUDIO"
+    BUNDLE_ID com.flarkaudio.vinylrestorationsuite
+    ICON_BIG flarkaudiologo.png
 )
 
 # Add source files to standalone app

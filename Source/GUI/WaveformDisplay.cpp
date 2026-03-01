@@ -16,7 +16,7 @@ WaveformDisplay::WaveformDisplay()
     startTimer (40); // 25 fps for smooth cursor updates
 
     // Enable OpenGL hardware acceleration for smooth waveform rendering
-    #if JUCE_OPENGL
+    #if JUCE_OPENGL && !JUCE_LINUX
     try
     {
         openGLContext.setComponentPaintingEnabled (true);
@@ -41,6 +41,25 @@ WaveformDisplay::~WaveformDisplay()
     if (useOpenGL)
         openGLContext.detach();
     #endif
+}
+
+bool WaveformDisplay::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (const auto& file : files)
+    {
+        juce::File f (file);
+        if (f.hasFileExtension ("wav;flac;aiff;mp3;ogg;vrs"))
+            return true;
+    }
+    return false;
+}
+
+void WaveformDisplay::filesDropped (const juce::StringArray& files, int, int)
+{
+    if (files.size() > 0 && onFileDropped)
+    {
+        onFileDropped (juce::File (files[0]));
+    }
 }
 
 void WaveformDisplay::loadFile (const juce::File& file)
@@ -85,6 +104,7 @@ void WaveformDisplay::clear()
 void WaveformDisplay::setPlaybackPosition (double position)
 {
     playbackPosition = juce::jlimit (0.0, 1.0, position);
+    repaint();
 }
 
 void WaveformDisplay::addClickMarker (int64_t samplePosition)
@@ -838,8 +858,8 @@ void WaveformDisplay::drawPlaybackCursor (juce::Graphics& g, const juce::Rectang
     double posInView = (playheadTime - startTime) / visibleDuration;
     float x = (float) (posInView * bounds.getWidth());
 
-    g.setColour (juce::Colours::yellow.withAlpha (0.8f));
-    g.drawVerticalLine ((int) x, (float) bounds.getY(), (float) bounds.getBottom());
+    g.setColour (juce::Colours::yellow);
+    g.fillRect (x - 1.0f, (float) bounds.getY(), 2.0f, (float) bounds.getHeight());
 }
 
 void WaveformDisplay::drawSelection (juce::Graphics& g, const juce::Rectangle<int>& bounds)
@@ -908,21 +928,79 @@ void WaveformDisplay::drawSpectrogram (juce::Graphics& g, const juce::Rectangle<
         juce::Graphics imgG (spectrogramImage);
         imgG.fillAll (juce::Colour (0xff050505));
 
-        // Use a glowing orange palette for spectral look
-        imgG.setColour (juce::Colours::orange.withAlpha (0.8f));
-        thumbnail.drawChannels (imgG, juce::Rectangle<int>(0, 0, lastWidth, lastHeight), startTime, endTime, verticalZoom * 1.5);
-        
-        // Add vertical frequency-like banding
-        for (int y = 0; y < lastHeight; y += 4)
+        if (mainAudioBuffer != nullptr && mainAudioBuffer->getNumSamples() > 0)
         {
-            imgG.setColour (juce::Colours::orange.withAlpha (0.05f));
-            imgG.drawHorizontalLine (y, 0.0f, (float)lastWidth);
+            // Real-time Spectral Analysis (Serato style)
+            // Divide the visible area into vertical strips (bins)
+            const int numStrips = lastWidth;
+            const int64_t startSample = static_cast<int64_t>(startTime * sampleRate);
+            const int64_t endSample = static_cast<int64_t>(endTime * sampleRate);
+            const int64_t samplesInView = endSample - startSample;
+            const int64_t samplesPerStrip = samplesInView / numStrips;
+
+            if (samplesPerStrip > 0)
+            {
+                for (int x = 0; x < numStrips; ++x)
+                {
+                    int64_t stripStart = startSample + (x * samplesPerStrip);
+                    int stripLen = (int)juce::jmin (samplesPerStrip, (int64_t)mainAudioBuffer->getNumSamples() - stripStart);
+                    
+                    if (stripLen <= 0) break;
+
+                    // Analyze frequency content of this strip (simplified)
+                    float lowEnergy = 0, midEnergy = 0, highEnergy = 0;
+                    
+                    // Sample every Nth sample for speed
+                    int step = juce::jmax(1, stripLen / 64); 
+                    const float* data = mainAudioBuffer->getReadPointer(0, (int)stripStart);
+                    
+                    float lastVal = 0;
+                    for (int i = 0; i < stripLen; i += step)
+                    {
+                        float val = std::abs(data[i]);
+                        float diff = std::abs(data[i] - lastVal);
+                        
+                        // Heuristic: Diff is higher for high frequencies
+                        if (diff > val * 1.5f) highEnergy += val;
+                        else if (diff > val * 0.5f) midEnergy += val;
+                        else lowEnergy += val;
+                        
+                        lastVal = data[i];
+                    }
+
+                    // Map energy to Serato colors: Bass = Red, Mid = Green, High = Blue
+                    float total = lowEnergy + midEnergy + highEnergy + 0.001f;
+                    juce::uint8 r = (juce::uint8)juce::jlimit(0, 255, (int)(255 * lowEnergy / total * 1.2f));
+                    juce::uint8 g_col = (juce::uint8)juce::jlimit(0, 255, (int)(255 * midEnergy / total * 1.2f));
+                    juce::uint8 b = (juce::uint8)juce::jlimit(0, 255, (int)(255 * highEnergy / total * 1.2f));
+                    
+                    juce::Colour stripColor = juce::Colour(r, g_col, b);
+                    imgG.setColour(stripColor);
+                    
+                    // Draw just this vertical strip of the thumbnail
+                    thumbnail.drawChannel(imgG, juce::Rectangle<int>(x, 0, 1, lastHeight), 
+                                         startTime + (x * visibleDuration / numStrips),
+                                         startTime + ((x + 1) * visibleDuration / numStrips),
+                                         0, verticalZoom);
+                }
+            }
         }
+        else
+        {
+            // Fallback to gradient if no buffer access
+            imgG.setColour (juce::Colours::orange.withAlpha (0.8f));
+            thumbnail.drawChannels (imgG, juce::Rectangle<int>(0, 0, lastWidth, lastHeight), startTime, endTime, verticalZoom);
+        }
+        
+        // Horizontal analyzer lines
+        imgG.setColour (juce::Colours::white.withAlpha (0.03f));
+        for (int i = 1; i < 6; ++i)
+            imgG.drawHorizontalLine (lastHeight * i / 6, 0.0f, (float)lastWidth);
     }
 
     g.drawImageAt (spectrogramImage, bounds.getX(), bounds.getY());
     
-    g.setColour (juce::Colours::orange.withAlpha (0.6f));
-    g.setFont (juce::Font(14.0f, juce::Font::bold));
-    g.drawText ("SPECTRAL VIEW", bounds.reduced(10), juce::Justification::topRight);
+    g.setColour (juce::Colours::white.withAlpha (0.5f));
+    g.setFont (juce::Font(12.0f, juce::Font::bold));
+    g.drawText ("SPECTRAL COLOR VIEW", bounds.reduced(10), juce::Justification::topRight);
 }

@@ -392,6 +392,7 @@ public:
         if (sampleRate <= 0.0 || numChannels <= 0)
             return false;
 
+        paused.store (true); // Ensure we start in paused state
         currentOutputFile = file;
         
         if (currentOutputFile.existsAsFile())
@@ -452,6 +453,9 @@ public:
         if (!isRecording())
             return 0.0;
 
+        if (paused.load())
+            return 0.0;
+
         return (juce::Time::getMillisecondCounterHiRes() - recordingStartMs) / 1000.0;
     }
 
@@ -477,6 +481,12 @@ public:
 
     void setSilenceThreshold (float db) { silenceThreshold.store (juce::Decibels::decibelsToGain (db)); }
     void setSilenceDuration (float seconds) { silenceDurationReq.store (seconds); }
+    void setPaused (bool shouldBePaused) { 
+        if (paused.load() && !shouldBePaused) {
+            recordingStartMs = juce::Time::getMillisecondCounterHiRes();
+        }
+        paused.store (shouldBePaused); 
+    }
 
     std::function<void(const float**, int, int)> onDataAvailable;
     std::function<void(double positionSeconds)> onSilenceDetected;
@@ -539,28 +549,31 @@ public:
                 maxLevel = juce::jmax (maxLevel, std::abs (channelsToRecord[ch][i]));
         }
 
-        writer->write (channelsToRecord, numSamples);
-
-        if (onDataAvailable)
-            onDataAvailable (channelsToRecord, channelsToWrite, numSamples);
-
-        // Track silence for track detection
-        if (maxLevel < currentThreshold)
+        if (!paused.load())
         {
-            silenceSamples += numSamples;
-            double silenceDuration = silenceSamples / currentSampleRate;
-            
-            if (silenceDuration > currentDurationReq && !isSilenceTriggered)
+            writer->write (channelsToRecord, numSamples);
+
+            if (onDataAvailable)
+                onDataAvailable (channelsToRecord, channelsToWrite, numSamples);
+
+            // Track silence for track detection
+            if (maxLevel < currentThreshold)
             {
-                isSilenceTriggered = true;
-                if (onSilenceDetected)
-                    onSilenceDetected (getSecondsRecorded());
+                silenceSamples += numSamples;
+                double silenceDuration = silenceSamples / currentSampleRate;
+                
+                if (silenceDuration > currentDurationReq && !isSilenceTriggered)
+                {
+                    isSilenceTriggered = true;
+                    if (onSilenceDetected)
+                        onSilenceDetected (getSecondsRecorded());
+                }
             }
-        }
-        else
-        {
-            silenceSamples = 0;
-            isSilenceTriggered = false;
+            else
+            {
+                silenceSamples = 0;
+                isSilenceTriggered = false;
+            }
         }
 
                 // Monitoring with gain
@@ -626,6 +639,7 @@ public:
             juce::File currentOutputFile;
             double recordingStartMs = 0.0;
             int channelsToWrite = 0;
+            std::atomic<bool> paused { false };
         };
 //==============================================================================
 // StandaloneWindow Implementation
@@ -673,7 +687,11 @@ class StandaloneWindow::RestorationAudioSource : public juce::AudioSource
 {
 public:
     RestorationAudioSource (juce::AudioSource& sourceToWrap, OnnxDenoiser& denoiserToUse, const bool& aiEnabledFlag, FilterBank& fb, const bool& eqEnabledFlag)
-        : source (sourceToWrap), denoiser (denoiserToUse), aiEnabled (aiEnabledFlag), filterBank (fb), eqEnabled (eqEnabledFlag) {}
+        : source (sourceToWrap), denoiser (denoiserToUse), aiEnabled (aiEnabledFlag), filterBank (fb), eqEnabled (eqEnabledFlag) 
+    {
+        leftLevel.store (0.0f);
+        rightLevel.store (0.0f);
+    }
 
     void prepareToPlay (int samplesPerBlockExpected, double sampleRate) override
     {
@@ -689,7 +707,13 @@ public:
     void getNextAudioBlock (const juce::AudioSourceChannelInfo& info) override
     {
         source.getNextAudioBlock (info);
-        if (info.buffer == nullptr || info.numSamples <= 0) return;
+        if (info.buffer == nullptr || info.numSamples <= 0) 
+        {
+            leftLevel.store (0.0f);
+            rightLevel.store (0.0f);
+            return;
+        }
+
         if (info.buffer->getNumChannels() != currentNumChannels) {
             currentNumChannels = info.buffer->getNumChannels();
             if (currentSampleRate > 0.0) {
@@ -698,12 +722,14 @@ public:
                 filterBank.prepare (spec);
             }
         }
+
         if (eqEnabled) {
             juce::dsp::AudioBlock<float> block (*info.buffer, (size_t)info.startSample);
             auto subBlock = block.getSubBlock (0, (size_t)info.numSamples);
             juce::dsp::ProcessContextReplacing<float> context (subBlock);
             filterBank.process (context);
         }
+
         if (aiEnabled) {
             if (info.startSample == 0 && info.numSamples == info.buffer->getNumSamples()) {
                 denoiser.setEnabled (true); denoiser.processBlock (*info.buffer, 1.0f);
@@ -716,11 +742,28 @@ public:
                     info.buffer->copyFrom (ch, info.startSample, tempBuffer, ch, 0, info.numSamples);
             }
         }
+
+        // Calculate levels for metering
+        float maxL = 0.0f, maxR = 0.0f;
+        auto* dataL = info.buffer->getReadPointer (0, info.startSample);
+        auto* dataR = info.buffer->getNumChannels() > 1 ? info.buffer->getReadPointer (1, info.startSample) : dataL;
+
+        for (int i = 0; i < info.numSamples; ++i)
+        {
+            maxL = juce::jmax (maxL, std::abs (dataL[i]));
+            maxR = juce::jmax (maxR, std::abs (dataR[i]));
+        }
+
+        leftLevel.store (maxL);
+        rightLevel.store (maxR);
     }
+
+    float getLevel (int channel) const { return channel == 0 ? leftLevel.load() : rightLevel.load(); }
 
 private:
     juce::AudioSource& source; OnnxDenoiser& denoiser; const bool &aiEnabled, &eqEnabled; FilterBank& filterBank;
     juce::AudioBuffer<float> tempBuffer; double currentSampleRate = 0.0; int currentBlockSize = 0, currentNumChannels = 2;
+    std::atomic<float> leftLevel, rightLevel;
 };
 
 StandaloneWindow::StandaloneWindow()
@@ -887,8 +930,21 @@ StandaloneWindow::~StandaloneWindow()
 
 void StandaloneWindow::updateTransportSourceFromBuffer (juce::int64 sampleOffset)
 {
-    if (transportSource.getTotalLength() > 0)
+    // Always use BufferAudioSource to ensure memory edits/recordings are audible
+    if (audioBuffer.getNumSamples() > 0)
     {
+        bool isNewSource = false;
+        if (bufferSource == nullptr || bufferSource->getTotalLength() != audioBuffer.getNumSamples())
+        {
+            // Reset reader source if we were using one
+            readerSource.reset();
+            
+            // Create and set buffer source
+            bufferSource.reset (new BufferAudioSource (audioBuffer));
+            transportSource.setSource (bufferSource.get(), 0, nullptr, sampleRate);
+            isNewSource = true;
+        }
+
         // Get current playback position in samples
         juce::int64 currentPositionSamples = static_cast<juce::int64> (transportSource.getCurrentPosition() * sampleRate);
 
@@ -904,11 +960,17 @@ void StandaloneWindow::updateTransportSourceFromBuffer (juce::int64 sampleOffset
         transportSource.setNextReadPosition (newPositionSamples);
 
         // Update GUI playback position
-        double totalLength = transportSource.getLengthInSeconds();
-        if (totalLength > 0.0)
+        double duration = audioBuffer.getNumSamples() / sampleRate;
+        if (duration > 0.0)
         {
-            mainComponent->updatePlaybackPosition (static_cast<double> (newPositionSamples) / (sampleRate * totalLength));
+            mainComponent->updatePlaybackPosition (static_cast<double> (newPositionSamples) / (sampleRate * duration));
         }
+    }
+    else
+    {
+        transportSource.setSource (nullptr);
+        bufferSource.reset();
+        readerSource.reset();
     }
 }
 
@@ -1006,6 +1068,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
     {
         menu.addCommandItem (&commandManager, fileOpen);
         menu.addCommandItem (&commandManager, fileClose);
+        menu.addItem (fileCloseNoSave, "Close Session (Discard Changes)");
         menu.addSeparator();
         menu.addCommandItem (&commandManager, fileSave);
         menu.addCommandItem (&commandManager, fileSaveAs);
@@ -1022,6 +1085,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
 
         menu.addSeparator();
         menu.addCommandItem (&commandManager, fileExit);
+        menu.addItem (fileExitNoSave, "Exit (Discard Changes)");
     }
     else if (topLevelMenuIndex == 1) // Edit
     {
@@ -1085,6 +1149,8 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
                      mainComponent != nullptr && mainComponent->getWaveformDisplay().showSpectralView);
         menu.addSeparator();
         menu.addItem (viewShowCorrectionList, "Show Correction List", true, showCorrectionList);
+        menu.addItem (viewShowTrackList, "Show Track List", true, showTrackList);
+        menu.addItem (viewShowUndoHistory, "Show Undo History", true, showUndoHistory);
         menu.addCommandItem (&commandManager, viewShowSpectrogram);
     }
     else if (topLevelMenuIndex == 4) // Options
@@ -1098,7 +1164,7 @@ juce::PopupMenu StandaloneWindow::getMenuForIndex (int topLevelMenuIndex, const 
     else if (topLevelMenuIndex == 5) // Help
     {
         menu.addItem (helpAbout, "About");
-        menu.addItem (helpDocumentation, "Documentation", false);
+        menu.addItem (helpDocumentation, "Documentation");
     }
 
     return menu;
@@ -1117,6 +1183,7 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
     {
         case fileRecentClear: recentFiles.clear(); menuItemsChanged(); break;
         case fileClose: closeFile(); break;
+        case fileCloseNoSave: hasUnsavedChanges = false; closeFile(); break;
         case fileExitNoSave: hasUnsavedChanges = false; juce::JUCEApplication::getInstance()->quit(); break;
         case editMetadata: showMetadataEditor(); break;
         case viewToggleSpectral:
@@ -1124,18 +1191,50 @@ void StandaloneWindow::menuItemSelected (int menuItemID, int)
                 auto& wd = mainComponent->getWaveformDisplay();
                 wd.showSpectralView = !wd.showSpectralView; wd.repaint();
             } break;
+        case viewShowCorrectionList:
+            showCorrectionList = !showCorrectionList;
+            if (mainComponent != nullptr) mainComponent->setCorrectionListVisible (showCorrectionList);
+            menuItemsChanged(); break;
+        case viewShowTrackList:
+            showTrackList = !showTrackList;
+            if (mainComponent != nullptr) mainComponent->setTrackListVisible (showTrackList);
+            menuItemsChanged(); break;
+        case viewShowUndoHistory:
+            showUndoHistory = !showUndoHistory;
+            if (mainComponent != nullptr) mainComponent->setUndoHistoryVisible (showUndoHistory);
+            menuItemsChanged(); break;
+        case processDetectClicks: detectClicks(); break;
+        case processRemoveClicks: removeClicks(); break;
+        case processDecrackle: applyDecrackle(); break;
+        case processNoiseReduction: applyNoiseReduction(); break;
+        case processGraphicEQ: showGraphicEQ(); break;
+        case processNormalise: normalise(); break;
+        case processChannelBalance: channelBalance(); break;
+        case processWowFlutterRemoval: wowFlutterRemoval(); break;
+        case processDropoutRestoration: dropoutRestoration(); break;
+        case processSpeedCorrection: speedCorrection(); break;
+        case processTurntableAnalyzer: turntableAnalyzer(); break;
+        case processDetectTracks: detectTracks(); break;
+        case processSplitTracks: splitTracks(); break;
+        case processBatchProcess: showBatchProcessor(); break;
+        case optionsAudioSettings: showAudioSettings(); break;
         case optionsProcessingSettings: showProcessingSettings(); break;
         case optionsRecordingSettings: showRecordingSettings(); break;
         case optionsAIDenoise: aiDenoiseEnabled = !aiDenoiseEnabled; realtimeDenoiser.setEnabled (aiDenoiseEnabled); break;
         case helpAbout: showAboutDialog(); break;
+        case helpDocumentation: showDocumentation(); break;
         default: break;
     }
 }
 
 bool StandaloneWindow::perform (const juce::ApplicationCommandTarget::InvocationInfo& info)
 {
-    if (info.commandID == transportPlay || info.commandID == transportPause) {
-        if (mainComponent != nullptr) mainComponent->buttonClicked (&mainComponent->getPlayPauseButton());
+    if (info.commandID == transportPlay) {
+        if (mainComponent != nullptr) mainComponent->buttonClicked (&mainComponent->getPlayButton());
+        return true;
+    }
+    if (info.commandID == transportPause) {
+        if (mainComponent != nullptr) mainComponent->buttonClicked (&mainComponent->getPauseButton());
         return true;
     }
     if (info.commandID == transportStop) {
@@ -1178,8 +1277,33 @@ bool StandaloneWindow::perform (const juce::ApplicationCommandTarget::Invocation
         case fileExport: exportFile(); return true;
         case fileRecord: toggleRecording(); return true;
         case fileExit: requestAppQuit(); return true;
-        case editUndo: if (undoManager.canUndo()) { undoManager.undo (audioBuffer, sampleRate); updateTransportSourceFromBuffer(); mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate); updateTitle(); if (mainComponent != nullptr) mainComponent->getUndoHistoryView().refresh(); } return true;
-        case editRedo: if (undoManager.canRedo()) { undoManager.redo (audioBuffer, sampleRate); updateTransportSourceFromBuffer(); mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate); updateTitle(); if (mainComponent != nullptr) mainComponent->getUndoHistoryView().refresh(); } return true;
+                case editUndo:
+                    if (undoManager.canUndo())
+                    {
+                        undoManager.undo (audioBuffer, sampleRate);
+                        updateTransportSourceFromBuffer();
+                        if (mainComponent != nullptr)
+                        {
+                            mainComponent->setAudioBuffer (&audioBuffer, sampleRate);
+                            mainComponent->getUndoHistoryView().refresh();
+                        }
+                        updateTitle();
+                    }
+                    return true;
+        
+                case editRedo:
+                    if (undoManager.canRedo())
+                    {
+                        undoManager.redo (audioBuffer, sampleRate);
+                        updateTransportSourceFromBuffer();
+                        if (mainComponent != nullptr)
+                        {
+                            mainComponent->setAudioBuffer (&audioBuffer, sampleRate);
+                            mainComponent->getUndoHistoryView().refresh();
+                        }
+                        updateTitle();
+                    }
+                    return true;
         case editSelectAll: if (audioBuffer.getNumSamples() > 0) { mainComponent->getWaveformDisplay().setSelection (0, audioBuffer.getNumSamples()); mainComponent->getWaveformDisplay().repaint(); } return true;
         case editDeselect: mainComponent->getWaveformDisplay().clearSelection(); mainComponent->getWaveformDisplay().repaint(); return true;
         case viewZoomIn: if (mainComponent != nullptr) mainComponent->zoomIn(); return true;
@@ -1231,26 +1355,35 @@ void StandaloneWindow::timerCallback()
 {
     if (isPlaying && !isRecording) {
         double pos = transportSource.getCurrentPosition();
-        if (mainComponent != nullptr) mainComponent->updatePlaybackPosition (pos);
+        double length = transportSource.getLengthInSeconds();
+        if (mainComponent != nullptr && length > 0.0) {
+            mainComponent->updatePlaybackPosition (pos / length);
+            if (restorationSource != nullptr) {
+                auto* rs = static_cast<RestorationAudioSource*>(restorationSource.get());
+                mainComponent->setMeterLevel (rs->getLevel(0), rs->getLevel(1));
+            }
+        }
     }
     if (isRecording) {
         if (mainComponent != nullptr) {
             mainComponent->setMeterLevel (recorder->getMeterLevel(0), recorder->getMeterLevel(1));
             mainComponent->setTransportTime (recorder->getSecondsRecorded());
         }
-    } else if (mainComponent != nullptr) {
+    } else if (!isPlaying && mainComponent != nullptr) {
         mainComponent->setMeterLevel (0.0f, 0.0f);
     }
 }
 
 void StandaloneWindow::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
-    if (source == &transportSource && !transportSource.isPlaying()) isPlaying = false;
+    if (source == &transportSource && !transportSource.isPlaying()) {
+        isPlaying = false;
+    }
 }
 
 void StandaloneWindow::getAllCommands (juce::Array<juce::CommandID>& commands)
 {
-    const juce::CommandID ids[] = { fileOpen, fileClose, fileSave, fileSaveAs, fileExport, fileRecord, fileExit, editUndo, editRedo, editSelectAll, editDeselect, viewZoomIn, viewZoomOut, viewZoomFit, viewShowSpectrogram };
+    const juce::CommandID ids[] = { fileOpen, fileClose, fileSave, fileSaveAs, fileExport, fileRecord, fileExit, editUndo, editRedo, editSelectAll, editDeselect, viewZoomIn, viewZoomOut, viewZoomFit, viewShowSpectrogram, transportPlay, transportStop };
     commands.addArray (ids, juce::numElementsInArray (ids));
 }
 
@@ -1265,6 +1398,8 @@ void StandaloneWindow::getCommandInfo (juce::CommandID commandID, juce::Applicat
         case editUndo: result.setInfo ("Undo", "Undoes action", "Edit", 0); result.addDefaultKeypress ('z', juce::ModifierKeys::commandModifier); break;
         case editRedo: result.setInfo ("Redo", "Redoes action", "Edit", 0); result.addDefaultKeypress ('y', juce::ModifierKeys::commandModifier); break;
         case editSelectAll: result.setInfo ("Select All", "Selects all", "Edit", 0); result.addDefaultKeypress ('a', juce::ModifierKeys::commandModifier); break;
+        case transportPlay: result.setInfo ("Play/Pause", "Toggles playback", "Transport", 0); result.addDefaultKeypress (juce::KeyPress::spaceKey, 0); break;
+        case transportStop: result.setInfo ("Stop", "Stops playback", "Transport", 0); result.addDefaultKeypress (juce::KeyPress::escapeKey, 0); break;
         default: break;
     }
 }
@@ -1277,7 +1412,7 @@ void StandaloneWindow::openFile (const juce::File& file)
         audioBuffer = std::move (newBuffer); sampleRate = newSampleRate; currentFile = file; currentSessionFile = juce::File();
         updateTransportSourceFromBuffer();
         if (mainComponent != nullptr) { mainComponent->setAudioBuffer (&audioBuffer, sampleRate); mainComponent->getUndoHistoryView().refresh(); }
-        recentFiles.addFile (file); menuItemsChanged(); updateTitle(); undoManager.clear();
+        recentFiles.addFile (file); menuItemsChanged(); updateTitle();
     }
 }
 
@@ -1514,10 +1649,7 @@ void StandaloneWindow::performClickDetection()
 
                     juce::String message = "Detected " + juce::String (count) + " clicks/pops in " + rangeInfo + ".";
                     mainComponent->getCorrectionListView().setStatusText (message);
-
-                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                            "Click Detection Complete",
-                                                            message + "\n\nUse 'Process > Remove Clicks' to apply corrections.");
+                    mainComponent->getWaveformDisplay().repaint(); // Force markers to show up
                 });
             (void) applier;
         }
@@ -1931,6 +2063,7 @@ void StandaloneWindow::applyNoiseReductionWithSettings (float reductionDB,
     }
 
     // Update waveform display
+    updateTransportSourceFromBuffer();
     mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
 
     hasUnsavedChanges = true;
@@ -2383,10 +2516,9 @@ void StandaloneWindow::showAboutDialog()
             setOpaque (false);
             setWantsKeyboardFocus (true);
 
-            // Load extra generated image
-            juce::File extraImgFile ("/home/flark/Pictures/Gemini_Generated_Image_8s3zb58s3zb58s3z.png");
-            if (extraImgFile.existsAsFile())
-                extraImage = juce::ImageFileFormat::loadFrom (extraImgFile);
+            // Load graphical logo to be drawn on the vinyl label
+            #include "../Resources/VRSLogoData.h"
+            flarkLogo = juce::ImageFileFormat::loadFrom (VRSlogo_png, VRSlogo_png_len);
 
             // Initialize audio demo
             if (audioDeviceManager != nullptr)
@@ -2507,8 +2639,8 @@ void StandaloneWindow::showAboutDialog()
         {
             auto bounds = getLocalBounds().toFloat();
 
-            // Semi-transparent dark overlay for entire screen
-            g.fillAll (juce::Colour (0xcc000000));
+            // Fully opaque dark background to hide MainComponent behind it
+            g.fillAll (juce::Colour (0xff111111));
 
             // Calculate centered content area (twice the original size: 1000x1160)
             float contentWidth = 1000.0f;
@@ -2520,20 +2652,6 @@ void StandaloneWindow::showAboutDialog()
             juce::Rectangle<float> contentBounds (contentX, contentY, contentWidth, contentHeight);
             g.setColour (juce::Colour (0xff1a1a1a));
             g.fillRoundedRectangle (contentBounds, 20.0f);
-
-            // Draw extra image if loaded
-            if (extraImage.isValid())
-            {
-                g.saveState();
-                g.reduceClipRegion (contentBounds.toNearestInt());
-                float imgScale = juce::jmax (contentWidth / extraImage.getWidth(), contentHeight / extraImage.getHeight());
-                float dw = extraImage.getWidth() * imgScale;
-                float dh = extraImage.getHeight() * imgScale;
-                g.setOpacity (0.15f); // Very subtle background
-                g.drawImage (extraImage, contentX + (contentWidth - dw) / 2.0f, contentY + (contentHeight - dh) / 2.0f, dw, dh,
-                             0, 0, extraImage.getWidth(), extraImage.getHeight());
-                g.restoreState();
-            }
 
             // Subtle border
             g.setColour (juce::Colour (0xff3a3a3a));
@@ -2675,13 +2793,14 @@ void StandaloneWindow::showAboutDialog()
                                   centre.x - labelRadius * 0.55f,
                                   centre.x + labelRadius * 0.55f);
 
-            // Company name BELOW the spindle - LARGE
-            g.setColour (juce::Colour (0xff2a2008));
-            g.setFont (juce::Font (juce::FontOptions (38.0f)).boldened());
-            g.drawText ("flarkAUDIO",
-                       centre.x - labelRadius * 0.9f, centre.y + labelRadius * 0.22f,
-                       labelRadius * 1.8f, 44.0f,
-                       juce::Justification::centred);
+            // Draw FlarkAudio logo on the label (rotating)
+            if (flarkLogo.isValid())
+            {
+                float logoW = labelRadius * 0.8f;
+                float logoH = logoW * (float)flarkLogo.getHeight() / (float)flarkLogo.getWidth();
+                g.drawImage (flarkLogo, centre.x - logoW / 2.0f, centre.y + labelRadius * 0.25f, logoW, logoH,
+                             0, 0, flarkLogo.getWidth(), flarkLogo.getHeight());
+            }
 
             // Year - smaller
             g.setFont (juce::Font (juce::FontOptions (18.0f)));
@@ -2780,7 +2899,7 @@ void StandaloneWindow::showAboutDialog()
             private:
                 juce::AudioDeviceManager* audioDeviceManager = nullptr;
                 juce::AudioSourcePlayer audioSourcePlayer;
-                juce::Image extraImage;
+                juce::Image flarkLogo;
                 juce::Random random;
         // Audio synthesis
         double currentSampleRate = 44100.0;
@@ -3075,8 +3194,6 @@ void StandaloneWindow::showGraphicEQ()
         {
             const char* bands[] = {"31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz",
                                    "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"};
-            const float freqs[] = {31.0f, 62.0f, 125.0f, 250.0f, 500.0f,
-                                   1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f};
 
             previewBuffer = makePreviewBuffer (buffer, previewSampleRate);
 
@@ -3084,7 +3201,7 @@ void StandaloneWindow::showGraphicEQ()
             {
                 auto& slider = sliders[i];
                 slider.setRange (-12.0, 12.0, 0.1);
-                slider.setValue (0.0);
+                slider.setValue (currentGains[i]);
                 slider.setSliderStyle (juce::Slider::LinearVertical);
                 slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 50, 18);
                 slider.setTextBoxIsEditable (false);
@@ -3315,15 +3432,8 @@ void StandaloneWindow::showGraphicEQ()
         juce::TextButton cancelButton;
     };
 
-    auto* dialog = new juce::DialogWindow ("Graphic Equaliser",
-                                           juce::Colour (0xff2a3338),
-                                           true);
     auto* content = new GraphicEQDialogComponent (lastEqGains, audioBuffer, sampleRate);
     content->setSize (900, 460);
-    dialog->setContentOwned (content, true);
-    dialog->setResizable (true, true);
-    dialog->setResizeLimits (700, 380, 1200, 720);
-    dialog->centreWithSize (900, 460);
 
     // Save current gains for potential restore on cancel
     auto originalGains = lastEqGains;
@@ -3334,114 +3444,64 @@ void StandaloneWindow::showGraphicEQ()
             filterBankProcessor.setEQBand (i, gains[i]);
     };
 
-    content->onAction = [dialog] (int result)
-    {
-        dialog->exitModalState (result);
-        dialog->setVisible (false);
-    };
+    auto* dw = new juce::DialogWindow ("Graphic Equaliser", juce::Colour (0xff2a3338), true, true);
+    dw->setContentOwned (content, true);
+    dw->setUsingNativeTitleBar (true);
+    dw->setResizable (true, true);
+    dw->setResizeLimits (700, 380, 1200, 720);
+    dw->centreWithSize (900, 460);
+    dw->setVisible (true);
+    dw->toFront (true);
 
-    dialog->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, dialog, originalGains] (int result)
+    content->onAction = [dw] (int result) { dw->exitModalState (result); };
+
+    dw->enterModalState (true, juce::ModalCallbackFunction::create (
+        [this, originalGains, dw] (int result)
         {
-            auto* content = dynamic_cast<GraphicEQDialogComponent*> (dialog->getContentComponent());
-            if (result == 1 && content != nullptr)
-            {
-                auto gains = content->getGains();
-                // ... rest of apply logic ...
-
-                bool hasChanges = false;
-                for (float gain : gains)
+                if (result == 1) // Apply
                 {
-                    if (std::abs (gain) > 0.1f)
+                    // Action already updated filterBankProcessor via onGainsChanged
+                    // Now we perform the actual processing on the buffer
+                    undoManager.saveState (audioBuffer, sampleRate, "Graphic EQ");
+                    auto range = getProcessingRange();
+                    if (range.end > range.start)
                     {
-                        hasChanges = true;
-                        break;
+                        mainComponent->getCorrectionListView().setStatusText ("Applying EQ...");
+                        
+                        // ESSENTIAL: Prepare the processor before offline processing
+                        juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) 2048, (juce::uint32) audioBuffer.getNumChannels() };
+                        filterBankProcessor.prepare (spec);
+
+                        const int blockSize = 2048;
+                        for (int start = range.start; start < range.end; start += blockSize)
+                        {
+                            int len = juce::jmin (blockSize, range.end - start);
+                            juce::dsp::AudioBlock<float> block (audioBuffer.getArrayOfWritePointers(),
+                                                                static_cast<size_t> (audioBuffer.getNumChannels()),
+                                                                static_cast<size_t> (start),
+                                                                static_cast<size_t> (len));
+                            juce::dsp::ProcessContextReplacing<float> context (block);
+                            filterBankProcessor.process (context);
+                        }
+                        
+                        updateTransportSourceFromBuffer(); // Update playback source
+                        mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
+                        hasUnsavedChanges = true;
+                        updateTitle();
+                        mainComponent->getCorrectionListView().setStatusText ("EQ applied successfully");
                     }
                 }
-
-                if (!hasChanges)
-                {
-                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                            "No Changes",
-                                                            "All bands are set to 0 dB.");
-                    delete dialog;
-                    return;
-                }
-
-                // Save state for undo
-                undoManager.saveState (audioBuffer, sampleRate, "Graphic EQ");
-
-                auto range = getProcessingRange();
-                if (range.end <= range.start)
-                {
-                    juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                            "Invalid Selection",
-                                                            "Selection range is empty.");
-                    delete dialog;
-                    return;
-                }
-
-                mainComponent->getCorrectionListView().setStatusText ("Applying EQ in " + range.rangeInfo + "...");
-
-                // Configure filter bank
-                juce::dsp::ProcessSpec spec;
-                spec.sampleRate = sampleRate;
-                spec.numChannels = static_cast<juce::uint32> (audioBuffer.getNumChannels());
-                spec.maximumBlockSize = 2048;
-
-                filterBankProcessor.prepare (spec);
-
-                // Set EQ gains (FilterBank has 10 bands at 31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz)
-                for (int i = 0; i < 10; ++i)
-                {
-                    filterBankProcessor.setEQBand (i, gains[static_cast<size_t> (i)]);
-                }
-
-                // Process audio
-                const int blockSize = 2048;
-                for (int startSample = range.start; startSample < range.end; startSample += blockSize)
-                {
-                    int samplesThisBlock = juce::jmin (blockSize, range.end - startSample);
-
-                    juce::dsp::AudioBlock<float> block (audioBuffer.getArrayOfWritePointers(),
-                                                        static_cast<size_t> (audioBuffer.getNumChannels()),
-                                                        static_cast<size_t> (startSample),
-                                                        static_cast<size_t> (samplesThisBlock));
-
-                    juce::dsp::ProcessContextReplacing<float> context (block);
-                    filterBankProcessor.process (context);
-                }
-
-                // Update display
-                mainComponent->getWaveformDisplay().updateFromBuffer (audioBuffer, sampleRate);
-
-                lastEqGains = gains;
-                hasUnsavedChanges = true;
-                updateTitle();
-
-                mainComponent->getCorrectionListView().setStatusText ("EQ applied successfully");
-                juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                        "Graphic Equaliser",
-                                                        "EQ applied successfully.");
-            }
-            else if (result == 2)
+            else if (result == 2) // Reset (handled as exit and reopen)
             {
-                // Reset - restore original gains and reopen
                 for (int i = 0; i < 10; ++i)
                     filterBankProcessor.setEQBand (i, originalGains[i]);
-                
-                delete dialog;
                 showGraphicEQ();
-                return;
             }
-            else if (result == 0)
+            else // Cancel or close
             {
-                // Cancel - restore original gains
                 for (int i = 0; i < 10; ++i)
                     filterBankProcessor.setEQBand (i, originalGains[i]);
             }
-
-            delete dialog;
         }
     ), true);
 }
@@ -4522,6 +4582,7 @@ void StandaloneWindow::showAudioSettings()
     if (audioSettingsWindow != nullptr)
     {
         delete audioSettingsWindow.getComponent();
+        audioSettingsWindow = nullptr;
         return;
     }
 
@@ -4537,23 +4598,31 @@ void StandaloneWindow::showAudioSettings()
         false,  // show channels as stereo pairs
         false   // hide advanced options
     );
-    content->setSize (500, 400);
+    content->setSize (500, 450);
 
     auto* dw = new juce::DialogWindow ("Audio Settings", juce::Colours::darkgrey, true, true);
     dw->setContentOwned (content, true);
     dw->setUsingNativeTitleBar (true);
     dw->setResizable (false, false);
-    dw->centreWithSize (dw->getWidth(), dw->getHeight());
+    dw->centreWithSize (500, 450);
+    dw->setVisible (true);
+    dw->toFront (true);
     
-    // Add to SafePointer so we can track it
     audioSettingsWindow = dw;
-    
-    // Use enterModalState to handle closing with OS button automatically if deleteOnClose is true
-    dw->enterModalState (true, nullptr, true);
+    dw->enterModalState (true, juce::ModalCallbackFunction::create ([this](int) {
+        audioSettingsWindow = nullptr;
+    }));
 }
 
 void StandaloneWindow::showProcessingSettings()
 {
+    if (processingSettingsWindow != nullptr)
+    {
+        delete processingSettingsWindow.getComponent();
+        processingSettingsWindow = nullptr;
+        return;
+    }
+
     auto applyCallback = [this]()
     {
         applyDenoiserSettings();
@@ -4573,8 +4642,13 @@ void StandaloneWindow::showProcessingSettings()
     dw->setResizable (true, true);
     dw->setResizeLimits (600, 400, 1000, 800);
     dw->centreWithSize (700, 520);
+    dw->setVisible (true);
+    dw->toFront (true);
     
-    dw->enterModalState (true, nullptr, true);
+    processingSettingsWindow = dw;
+    dw->enterModalState (true, juce::ModalCallbackFunction::create ([this](int) {
+        processingSettingsWindow = nullptr;
+    }));
 }
 
 void StandaloneWindow::applyDenoiserSettings()
@@ -4594,9 +4668,28 @@ void StandaloneWindow::applyDenoiserSettings()
 void StandaloneWindow::toggleRecording()
 {
     if (isRecording)
-        stopRecording();
+    {
+        if (isRecordingPaused)
+        {
+            // Second click: actually start recording
+            isRecordingPaused = false;
+            if (recorder != nullptr)
+                recorder->setPaused (false);
+                
+            if (mainComponent != nullptr)
+                mainComponent->setRecording (true);
+        }
+        else
+        {
+            // Click while recording: stop
+            stopRecording();
+        }
+    }
     else
+    {
+        // First click: prepare and enter Rec-pause
         startRecording();
+    }
 }
 
 void StandaloneWindow::toggleMonitoring()
@@ -4688,19 +4781,26 @@ void StandaloneWindow::startRecording()
 
     recorder->setSilenceThreshold (silenceThresholdDB);
     recorder->setSilenceDuration (silenceDurationRequirement);
+    recorder->setPaused (true);
 
     if (mainComponent != nullptr)
     {
         mainComponent->getWaveformDisplay().prepareForRecording (deviceSampleRate, juce::jmin (2, inputChannels));
         mainComponent->getCorrectionListView().setStatusText ("Recording to: " + outputFile.getFileName());
+        
+        // Add first track marker at the beginning
+        mainComponent->getTrackListView().addMarker (0, "Track 1");
     }
 
     bufferedRecording.reset();
-    setRecordingState (true);
+    
+    // Enter Rec-pause state
     isRecording = true;
+    isRecordingPaused = true;
+    setRecordingState (true);
 
     if (mainComponent != nullptr)
-        mainComponent->getCorrectionListView().setStatusText ("Recording (buffered)...");
+        mainComponent->getCorrectionListView().setStatusText ("Recording Standby (Rec-pause)...");
 }
 
 void StandaloneWindow::stopRecording()
@@ -4715,8 +4815,9 @@ void StandaloneWindow::stopRecording()
         recorder->stop();
     }
 
-    setRecordingState (false);
     isRecording = false;
+    isRecordingPaused = false;
+    setRecordingState (false);
 
     if (!recordedFile.existsAsFile() || recordedFile.getSize() == 0)
     {
@@ -4729,7 +4830,11 @@ void StandaloneWindow::stopRecording()
     if (mainComponent != nullptr)
         mainComponent->getCorrectionListView().setStatusText ("Opening recording...");
 
+    // Save state BEFORE opening the new file so we can undo back to previous buffer
+    undoManager.saveState (audioBuffer, sampleRate, "Record Audio");
+    
     openFile (recordedFile);
+    if (mainComponent != nullptr) mainComponent->getUndoHistoryView().refresh();
 }
 
 void StandaloneWindow::loadRecordingFromMemory (juce::MemoryBlock&& data)
@@ -4795,11 +4900,11 @@ void StandaloneWindow::loadRecordingFromMemory (juce::MemoryBlock&& data)
 
 void StandaloneWindow::setRecordingState (bool recording)
 {
-    isRecording = recording;
     if (mainComponent != nullptr)
     {
         mainComponent->setRecording (recording);
-        mainComponent->setTransportTime (0.0);
+        if (recording && !isRecordingPaused)
+            mainComponent->setTransportTime (0.0);
     }
 
     menuItemsChanged();
@@ -4957,7 +5062,7 @@ StandaloneWindow::MainComponent::MainComponent (AudioUndoManager& undoMgr)
         {
             if (parentWindow->undoManager.performUndoTo (index, parentWindow->audioBuffer, parentWindow->sampleRate))
             {
-                waveformDisplay.updateFromBuffer (parentWindow->audioBuffer, parentWindow->sampleRate);
+                setAudioBuffer (&parentWindow->audioBuffer, parentWindow->sampleRate);
                 undoHistoryView.refresh();
                 parentWindow->updateTitle();
             }
@@ -4968,35 +5073,36 @@ StandaloneWindow::MainComponent::MainComponent (AudioUndoManager& undoMgr)
     addAndMakeVisible (waveformDisplay);
 
     // Transport controls (retro cassette deck style)
-    addAndMakeVisible (rewindButton);
-    addAndMakeVisible (playPauseButton);
-    addAndMakeVisible (stopButton);
     addAndMakeVisible (recordButton);
+    addAndMakeVisible (playButton);
+    addAndMakeVisible (rewindButton);
+    addAndMakeVisible (forwardButton);
+    addAndMakeVisible (stopButton);
+    addAndMakeVisible (pauseButton);
     addAndMakeVisible (monitorButton);
     addAndMakeVisible (addMarkerButton);
     addAndMakeVisible (delMarkerButton);
-    addAndMakeVisible (forwardButton);
     addAndMakeVisible (loopSelectionButton);
     addAndMakeVisible (zoomToSelectionButton);
 
-    rewindButton.addListener (this);
-    playPauseButton.addListener (this);
-    stopButton.addListener (this);
     recordButton.addListener (this);
+    playButton.addListener (this);
+    rewindButton.addListener (this);
+    forwardButton.addListener (this);
+    stopButton.addListener (this);
+    pauseButton.addListener (this);
     monitorButton.addListener (this);
     addMarkerButton.addListener (this);
     delMarkerButton.addListener (this);
-    forwardButton.addListener (this);
     loopSelectionButton.addListener (this);
     zoomToSelectionButton.addListener (this);
 
-    addMarkerButton.setTooltip ("Add track marker at current position");
-    delMarkerButton.setTooltip ("Remove selected track marker");
-
+    recordButton.setTooltip ("Start recording (Standby)");
+    playButton.setTooltip ("Play playback");
     rewindButton.setTooltip ("Skip backward 5 seconds");
-    playPauseButton.setTooltip ("Play/Pause playback (Spacebar)");
+    forwardButton.setTooltip ("Skip forward 5 seconds");
     stopButton.setTooltip ("Stop playback and return to start");
-    recordButton.setTooltip ("Start recording");
+    pauseButton.setTooltip ("Pause playback");
     monitorButton.setTooltip ("Enable/Disable input monitoring");
     monitorButton.setClickingTogglesState (true);
     monitorButton.setToggleState (true, juce::dontSendNotification);
@@ -5006,10 +5112,23 @@ StandaloneWindow::MainComponent::MainComponent (AudioUndoManager& undoMgr)
     zoomToSelectionButton.setTooltip ("Zoom to current selection");
     timeLabel.setTooltip ("Current playback time");
 
-    recordButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff4a1a1a));
-    recordButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffaa2222));
-    recordButton.setColour (juce::TextButton::textColourOffId, juce::Colour (0xffcccccc));
-    recordButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    // Cassette deck button styling
+    recordButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff4a1a1a)); // Dark red
+    recordButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffaa2222)); // Active red
+    recordButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    
+    playButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1a4a1a)); // Dark green
+    playButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff22aa22)); // Active green
+    playButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+
+    pauseButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2a2a));
+    pauseButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+
+    stopButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2a2a));
+    stopButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+
+    rewindButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2a2a));
+    forwardButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2a2a));
 
     // Enable keyboard focus for spacebar control
     setWantsKeyboardFocus (true);
@@ -5048,8 +5167,8 @@ StandaloneWindow::MainComponent::MainComponent (AudioUndoManager& undoMgr)
     for (auto* s : { &volumeSlider, &recordVolumeSlider, &monitorVolumeSlider })
     {
         addAndMakeVisible (s);
-        s->setRange (0.0, 100.0, 1.0);
-        s->setValue (70.0);
+        s->setRange (0.0, 200.0, 1.0);
+        s->setValue (100.0);
         s->setSliderStyle (juce::Slider::LinearVertical);
         s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 45, 18);
         s->setTextValueSuffix ("%");
@@ -5479,6 +5598,12 @@ StandaloneWindow::MainComponent::MainComponent (AudioUndoManager& undoMgr)
         }
     };
 
+    waveformDisplay.onFileDropped = [this] (const juce::File& file)
+    {
+        if (parentWindow != nullptr)
+            parentWindow->openFile (file);
+    };
+
     trackListView.onMarkerClicked = [this] (int64_t position)
     {
         if (parentWindow != nullptr)
@@ -5655,24 +5780,30 @@ void StandaloneWindow::MainComponent::resized()
     auto transportArea = area.removeFromTop (50);
     transportArea.reduce (10, 10);
 
-    rewindButton.setBounds (transportArea.removeFromLeft (50));
-    transportArea.removeFromLeft (5);
-    playPauseButton.setBounds (transportArea.removeFromLeft (80));
-    transportArea.removeFromLeft (5);
-    stopButton.setBounds (transportArea.removeFromLeft (60));
-    transportArea.removeFromLeft (5);
-    recordButton.setBounds (transportArea.removeFromLeft (60));
-    transportArea.removeFromLeft (5);
-    monitorButton.setBounds (transportArea.removeFromLeft (50));
-    transportArea.removeFromLeft (5);
+    const int transportBtnWidth = 50;
+    const int transportBtnSpacing = 5;
+
+    recordButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
+    playButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
+    rewindButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
+    forwardButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
+    stopButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
+    pauseButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing * 2);
+
+    monitorButton.setBounds (transportArea.removeFromLeft (transportBtnWidth));
+    transportArea.removeFromLeft (transportBtnSpacing);
     addMarkerButton.setBounds (transportArea.removeFromLeft (70));
-    transportArea.removeFromLeft (5);
+    transportArea.removeFromLeft (transportBtnSpacing);
     delMarkerButton.setBounds (transportArea.removeFromLeft (70));
-    transportArea.removeFromLeft (5);
-    forwardButton.setBounds (transportArea.removeFromLeft (50));
-    transportArea.removeFromLeft (5);
+    transportArea.removeFromLeft (transportBtnSpacing);
     loopSelectionButton.setBounds (transportArea.removeFromLeft (80));
-    transportArea.removeFromLeft (5);
+    transportArea.removeFromLeft (transportBtnSpacing);
     zoomToSelectionButton.setBounds (transportArea.removeFromLeft (90));
     transportArea.removeFromLeft (10);
 
@@ -5765,7 +5896,21 @@ void StandaloneWindow::MainComponent::resized()
 
 void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
 {
-    if (button == &playPauseButton)
+    if (button == &playButton)
+    {
+        if (parentWindow && parentWindow->transportSource.getTotalLength() > 0.0)
+        {
+            if (!parentWindow->isPlaying)
+            {
+                // Play/Resume
+                seekToSelectionStart();
+                parentWindow->transportSource.start();
+                parentWindow->isPlaying = true;
+                DBG ("Playback started");
+            }
+        }
+    }
+    else if (button == &pauseButton)
     {
         if (parentWindow && parentWindow->transportSource.getTotalLength() > 0.0)
         {
@@ -5774,17 +5919,14 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
                 // Pause
                 parentWindow->transportSource.stop();
                 parentWindow->isPlaying = false;
-                playPauseButton.setButtonText ("Play");
                 DBG ("Playback paused");
             }
             else
             {
-                // Play/Resume
-                seekToSelectionStart();
+                // Resume from pause
                 parentWindow->transportSource.start();
                 parentWindow->isPlaying = true;
-                playPauseButton.setButtonText ("Pause");
-                DBG ("Playback started");
+                DBG ("Playback resumed");
             }
         }
     }
@@ -5794,7 +5936,6 @@ void StandaloneWindow::MainComponent::buttonClicked (juce::Button* button)
         {
             parentWindow->transportSource.stop();
             parentWindow->isPlaying = false;
-            playPauseButton.setButtonText ("Play");
 
             // Reset to selection start if selection exists, otherwise beginning
             int64_t selStart = -1, selEnd = -1;
@@ -6039,6 +6180,19 @@ void StandaloneWindow::MainComponent::sliderValueChanged (juce::Slider* slider)
     }
 }
 
+bool StandaloneWindow::MainComponent::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    if (parentWindow != nullptr)
+        return parentWindow->isInterestedInFileDrag (files);
+    return false;
+}
+
+void StandaloneWindow::MainComponent::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    if (parentWindow != nullptr)
+        parentWindow->filesDropped (files, x, y);
+}
+
 bool StandaloneWindow::MainComponent::keyPressed (const juce::KeyPress& key)
 {
     // Common keys that should always work
@@ -6106,9 +6260,12 @@ void StandaloneWindow::MainComponent::setAudioBuffer (const juce::AudioBuffer<fl
 {
     currentBuffer = buffer;
     currentSampleRate = sampleRate;
+    waveformDisplay.setAudioBuffer (buffer);
 
     if (buffer != nullptr)
     {
+        waveformDisplay.updateFromBuffer (*buffer, sampleRate);
+
         statusLabel.setText (juce::String (buffer->getNumChannels()) + " channels, " +
                            juce::String (sampleRate / 1000.0, 1) + " kHz, " +
                            juce::String (buffer->getNumSamples() / sampleRate, 2) + " seconds",
@@ -6116,6 +6273,11 @@ void StandaloneWindow::MainComponent::setAudioBuffer (const juce::AudioBuffer<fl
 
         // Grab keyboard focus so spacebar works immediately after loading
         grabKeyboardFocus();
+    }
+    else
+    {
+        waveformDisplay.clear();
+        statusLabel.setText ("No audio file loaded", juce::dontSendNotification);
     }
 }
 
@@ -6148,25 +6310,59 @@ void StandaloneWindow::MainComponent::setCorrectionListVisible (bool visible)
     resized();
 }
 
+void StandaloneWindow::MainComponent::setTrackListVisible (bool visible)
+{
+    // If we want to hide specifically one tab, TabbedComponent doesn't have a simple setTabVisible
+    // But we can just switch to it if it's being "shown"
+    if (visible)
+        listTabs.setCurrentTabIndex (1); // 1 is Tracks
+}
+
+void StandaloneWindow::MainComponent::setUndoHistoryVisible (bool visible)
+{
+    if (visible)
+        listTabs.setCurrentTabIndex (2); // 2 is History
+}
+
 void StandaloneWindow::MainComponent::setRecording (bool recording)
 {
+    bool isPaused = (parentWindow != nullptr && parentWindow->isRecordingPaused);
+    
     recordButton.setToggleState (recording, juce::dontSendNotification);
-    recordButton.setButtonText (recording ? "STOP" : "Rec");
-    recordButton.setTooltip (recording ? "Stop recording" : "Start recording");
+    
+    if (recording)
+    {
+        if (isPaused)
+        {
+            recordButton.setButtonText (juce::String::fromUTF8("\xe2\x8f\xb8")); // ⏸ REC-PAUSE symbol
+            recordButton.setTooltip ("Click again to start recording");
+        }
+        else
+        {
+            recordButton.setButtonText (juce::String::fromUTF8("\xe2\x8f\xb9")); // ⏹ STOP symbol
+            recordButton.setTooltip ("Stop recording");
+        }
+        
+        listTabs.setCurrentTabIndex (1); // Switch to Tracks tab when recording
+    }
+    else
+    {
+        recordButton.setButtonText (juce::String::fromUTF8("\xe2\x8f\xba")); // ⏺ Rec text
+        recordButton.setTooltip ("Start recording (Standby)");
+    }
     
     if (parentWindow != nullptr)
         monitorButton.setToggleState (parentWindow->monitoringEnabled, juce::dontSendNotification);
-        
-    if (recording)
-        playPauseButton.setButtonText ("Play");
 
-    playPauseButton.setEnabled (!recording);
-    stopButton.setEnabled (!recording);
-    rewindButton.setEnabled (!recording);
-    forwardButton.setEnabled (!recording);
-    loopSelectionButton.setEnabled (!recording);
-    zoomToSelectionButton.setEnabled (!recording);
-    positionSlider.setEnabled (!recording);
+    bool canTransport = !recording || isPaused;
+    playButton.setEnabled (canTransport);
+    stopButton.setEnabled (canTransport);
+    pauseButton.setEnabled (canTransport);
+    rewindButton.setEnabled (canTransport);
+    forwardButton.setEnabled (canTransport);
+    loopSelectionButton.setEnabled (canTransport);
+    zoomToSelectionButton.setEnabled (canTransport);
+    positionSlider.setEnabled (canTransport);
 }
 
 void StandaloneWindow::MainComponent::setTransportTime (double seconds)
@@ -6204,6 +6400,13 @@ bool StandaloneWindow::MainComponent::seekToSelectionStart()
 
 void StandaloneWindow::showRecordingSettings()
 {
+    if (recordingSettingsWindow != nullptr)
+    {
+        delete recordingSettingsWindow.getComponent();
+        recordingSettingsWindow = nullptr;
+        return;
+    }
+
     class RecordingSettingsComponent : public juce::Component
     {
     public:
@@ -6299,18 +6502,89 @@ void StandaloneWindow::showRecordingSettings()
     auto* content = new RecordingSettingsComponent (recordingFormat, recordingBitDepth, recordingQuality, autoSaveRecordings, silenceThresholdDB, silenceDurationRequirement);
     content->setSize (500, 320);
 
-    juce::DialogWindow::LaunchOptions options;
-    options.content.setOwned (content);
-    options.dialogTitle = "Recording Settings";
-    options.dialogBackgroundColour = juce::Colours::darkgrey;
-    options.escapeKeyTriggersCloseButton = true;
-    options.useNativeTitleBar = true;
-    options.resizable = false;
+    auto* dw = new juce::DialogWindow ("Recording Settings", juce::Colours::darkgrey, true, true);
+    dw->setContentOwned (content, true);
+    dw->setUsingNativeTitleBar (true);
+    dw->setResizable (false, false);
+    dw->centreWithSize (500, 320);
+    dw->setVisible (true);
+    dw->toFront (true);
+    
+    recordingSettingsWindow = dw;
+    dw->enterModalState (true, juce::ModalCallbackFunction::create ([this, content](int) {
+        content->updateSettings();
+        recordingSettingsWindow = nullptr;
+    }));
+}
 
-    if (auto* dw = options.launchAsync())
+void StandaloneWindow::showDocumentation()
+{
+    if (documentationWindow != nullptr)
     {
-        dw->enterModalState (true, juce::ModalCallbackFunction::create ([content](int) {
-            content->updateSettings();
-        }));
+        documentationWindow->toFront (true);
+        return;
     }
+
+    auto* editor = new juce::TextEditor();
+    editor->setMultiLine (true);
+    editor->setReadOnly (true);
+    editor->setScrollbarsShown (true);
+    editor->setCaretVisible (false);
+    editor->setFont (juce::Font (juce::Font::getDefaultMonospacedFontName(), 14.0f, juce::Font::plain));
+    editor->setSize (700, 600);
+    
+    // Set colors to match Reaper style
+    editor->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff1a1a1a));
+    editor->setColour (juce::TextEditor::textColourId, juce::Colours::lightgrey);
+    
+    juce::String helpText = 
+        "Vinyl Restoration Suite - Quick Help\n"
+        "====================================\n\n"
+        "1. Loading Audio\n"
+        "   - Use File > Open or drag and drop a WAV/FLAC/MP3 file onto the waveform.\n\n"
+        "2. Playback\n"
+        "   - Spacebar: Play/Pause\n"
+        "   - Escape: Stop\n"
+        "   - Use the transport buttons (Play, Stop, Rewind, Fast Forward).\n\n"
+        "3. Selection\n"
+        "   - Left-click and drag on the waveform to make a selection.\n"
+        "   - Shift + Left-click to extend selection.\n"
+        "   - Use selection handles to adjust.\n\n"
+        "4. Process Menu\n"
+        "   - Detect Clicks: Automatically find clicks/pops.\n"
+        "   - Remove Clicks: Fix detected clicks using chosen method.\n"
+        "   - Noise Reduction: Apply AI or spectral denoising.\n"
+        "   - Graphic EQ: Adjust 10-band equalizer.\n\n"
+        "5. Recording\n"
+        "   - Click REC to enter standby (Rec-pause).\n"
+        "   - Click REC again to start writing to file.\n"
+        "   - Click STOP to finish and load the recording.\n\n"
+        "6. Shortcuts\n"
+        "   - Ctrl+Z: Undo\n"
+        "   - Ctrl+Y: Redo\n"
+        "   - Ctrl+X / Ctrl+C / Ctrl+V: Cut/Copy/Paste selection\n"
+        "   - Ctrl+A: Select All\n"
+        "   - Mouse Wheel: Scroll waveform\n"
+        "   - Ctrl + Mouse Wheel: Zoom horizontally\n"
+        "   - Shift + Mouse Wheel: Zoom vertically\n\n"
+        "7. Spectral View\n"
+        "   - Click 'Spectrum' button to toggle Serato-style colored waveform.\n"
+        "   - Red = Bass, Green = Mids, Blue = High frequencies.\n\n"
+        "8. About\n"
+        "   - Click Help > About to see version info and the spinning vinyl.\n";
+
+    editor->setText (helpText, false);
+
+    auto* dw = new juce::DialogWindow ("Documentation", juce::Colours::black, true, true);
+    dw->setContentOwned (editor, true);
+    dw->setUsingNativeTitleBar (true);
+    dw->setResizable (true, true);
+    dw->centreWithSize (700, 600);
+    dw->setVisible (true);
+    dw->toFront (true);
+    
+    documentationWindow = dw;
+    dw->enterModalState (true, juce::ModalCallbackFunction::create ([this](int) {
+        documentationWindow = nullptr;
+    }));
 }

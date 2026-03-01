@@ -59,7 +59,16 @@ jobs:
             patchelf
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="13.0" \
+              -DENABLE_ONNX_RUNTIME=ON \
+              -DONNXRUNTIME_USE_COREML=ON
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+          fi
 
       - name: Build
         run: cmake --build build --config Release
@@ -74,34 +83,42 @@ jobs:
           PLUGIN=$(find build -name "*.vst3" | head -1)
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             STANDALONE=$(find build -type d -name "*.app" | head -1)
+            LIB_NAME="libonnxruntime.dylib"
+            LIB_PATTERN="libonnxruntime*.dylib"
+            ARTIFACT_SUFFIX="Universal-Ventura"
           else
-            STANDALONE=$(find build -type f -perm -u+x ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" ! -name "cpack*" ! -name "*.vst3" ! -name "ctest*" ! -name "JUCE*" | grep -i "VinylRestorationSuite" | head -1)
+            # Look for binary in the Standalone_artefacts directory
+            STANDALONE=$(find build -path "*Standalone_artefacts*" -type f -executable ! -name "*.so" ! -name "*.dylib" ! -name "cmake*" | head -1)
+            LIB_NAME="libonnxruntime.so"
+            LIB_PATTERN="libonnxruntime.so*"
+            ARTIFACT_SUFFIX=""
+          fi
+
+          if [ -z "$ARTIFACT_SUFFIX" ]; then
+            DISPLAY_NAME="${{ matrix.artifact_name }}"
+          else
+            DISPLAY_NAME="${{ matrix.artifact_name }}-$ARTIFACT_SUFFIX"
           fi
 
           # Function to fix shared library dependencies
           fix_deps() {
             local binary="$1"
-            local lib_name="$2"
-            local lib_pattern="$3"
+            local l_name="$2"
+            local l_pattern="$3"
             
             if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-              # Find the directory containing the actual libraries (not just the ones copied by JUCE)
-              local lib_dir=$(find build -name "$lib_name" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
+              local lib_dir=$(find build -name "$l_name" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
               if [ -n "$lib_dir" ]; then
-                echo "Found library directory: $lib_dir"
-                # Copy ALL files matching the pattern (preserving symlinks or copying all variants)
-                cp -P "$lib_dir"/$lib_pattern "$(dirname "$binary")/"
-                # Also ensure the actual binary version is followed if we use -L elsewhere
-                # Here we just copy everything so the exact filename requested exists
+                cp -P "$lib_dir"/$l_pattern "$(dirname "$binary")/"
                 patchelf --set-rpath '$ORIGIN' "$binary"
               fi
             elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-              local lib_src=$(find build -name "$lib_name" | head -1)
+              local lib_src=$(find build -name "$l_name" | head -1)
               if [ -n "$lib_src" ]; then
                 cp "$lib_src" "$(dirname "$binary")/"
-                local old_path=$(otool -L "$binary" | grep "$lib_name" | awk '{print $1}')
+                local old_path=$(otool -L "$binary" | grep "libonnxruntime" | awk '{print $1}')
                 if [ -n "$old_path" ]; then
-                  install_name_tool -change "$old_path" "@loader_path/$lib_name" "$binary"
+                  install_name_tool -change "$old_path" "@loader_path/$l_name" "$binary"
                 fi
               fi
             fi
@@ -109,36 +126,43 @@ jobs:
 
           # Process VST3
           if [ -n "$PLUGIN" ]; then
-            DEST="release-files/AudioRestoration-${{ matrix.artifact_name }}.vst3"
+            DEST="release-files/AudioRestoration-$DISPLAY_NAME.vst3"
             cp -R "$PLUGIN" "$DEST"
-            INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -perm +111 \) ! -name "*.dylib" | head -1)
-            if [ -n "$INNER_BIN" ]; then
-              fix_deps "$INNER_BIN" "libonnxruntime.so" "libonnxruntime.so*"
+            if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+                INNER_BIN=$(find "$DEST" -type f -perm +111 ! -name "*.dylib" | head -1)
+            else
+                INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -perm +111 \) ! -name "*.dylib" | head -1)
             fi
-            cd release-files && zip -r "AudioRestoration-${{ matrix.artifact_name }}-VST3.zip" "$(basename "$DEST")" && cd ..
+            
+            if [ -n "$INNER_BIN" ]; then
+              fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
+            fi
+            cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-VST3.zip" "$(basename "$DEST")" && cd ..
           fi
 
           # Process Standalone
           if [ -n "$STANDALONE" ]; then
-            DEST_NAME="AudioRestoration-${{ matrix.artifact_name }}-Standalone"
+            DEST_NAME="AudioRestoration-$DISPLAY_NAME-Standalone"
             if [[ "$STANDALONE" == *.app ]]; then
                DEST_PATH="release-files/$DEST_NAME.app"
                cp -R "$STANDALONE" "$DEST_PATH"
                INNER_BIN=$(find "$DEST_PATH" -type f -perm +111 ! -name "*.dylib" | head -1)
-               fix_deps "$INNER_BIN" "libonnxruntime.so" "libonnxruntime.so*"
+               fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
             else
-               DEST_PATH="release-files/$DEST_NAME"
-               cp "$STANDALONE" "$DEST_PATH"
-               # For Linux standalone, copy libs to same folder as binary
-               fix_deps "$DEST_PATH" "libonnxruntime.so" "libonnxruntime.so*"
+               DEST_PATH="release-files/$DEST_NAME-Binary"
+               mkdir -p "$DEST_PATH"
+               cp "$STANDALONE" "$DEST_PATH/"
+               STANDALONE_DIR=$(dirname "$STANDALONE")
+               [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" "$DEST_PATH/"
+               [ -d "$STANDALONE_DIR/kernels" ] && cp -R "$STANDALONE_DIR/kernels" "$DEST_PATH/"
+               fix_deps "$DEST_PATH/$(basename "$STANDALONE")" "$LIB_NAME" "$LIB_PATTERN"
             fi
             
             cd release-files
             if [[ "${{ matrix.os }}" == "ubuntu-latest" && "$STANDALONE" != *.app ]]; then
-               # Include all variants in the zip root for Linux standalone
-               zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so*
+               zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so*
             else
-               zip -r "AudioRestoration-${{ matrix.artifact_name }}-Standalone.zip" "$(basename "$DEST_PATH")"
+               zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")"
             fi
             cd ..
           fi
@@ -161,7 +185,13 @@ jobs:
           
           Write-Host "=== Searching for VST3 and Standalone ==="
           $plugin = Get-ChildItem -Recurse build -Include *.vst3 | Select-Object -First 1
-          $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { $_.Name -like "*VinylRestorationSuite*" -and $_.Name -notlike "*cmake*" -and $_.Name -notlike "*vst3*" } | Select-Object -First 1
+          # Look for .exe in Standalone_artefacts directory to be more precise
+          $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { ($_.FullName -like "*Standalone_artefacts*") -and ($_.Name -notlike "*cmake*") } | Select-Object -First 1
+          
+          if (-not $standalone) {
+            # Fallback search if artefacts dir not found
+            $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { ($_.Name -like "*Vinyl*Restoration*Suite*") -and ($_.Name -notlike "*cmake*") -and ($_.Name -notlike "*vst3*") } | Select-Object -First 1
+          }
 
           Write-Host "Found plugin: $($plugin.FullName)"
           Write-Host "Found standalone: $($standalone.FullName)"
@@ -176,12 +206,13 @@ jobs:
 
           # Copy and Zip Standalone
           if ($standalone) {
-            $destDir = New-Item -ItemType Directory -Path "release-files/AudioRestoration-Windows-Standalone" -Force
-            Copy-Item $standalone.FullName -Destination $destDir.FullName -Force
+            $destDir = "release-files/AudioRestoration-Windows-Standalone"
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
             $standaloneDir = Split-Path $standalone.FullName
-            Get-ChildItem -Path $standaloneDir -Filter *.dll | Copy-Item -Destination $destDir.FullName -Force
+            # Copy EVERYTHING from the folder where the .exe lives (DLLs, models, kernels)
+            Copy-Item -Path "$standaloneDir\*" -Destination $destDir -Recurse -Force
             $zipPath = "release-files/AudioRestoration-Windows-Standalone.zip"
-            Compress-Archive -Path $destDir.FullName -DestinationPath $zipPath -Force
+            Compress-Archive -Path $destDir -DestinationPath $zipPath -Force
           }
 
       - name: Upload Release Assets (Windows)

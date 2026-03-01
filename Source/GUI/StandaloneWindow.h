@@ -87,6 +87,7 @@ private:
         fileExport,
         fileRecord,
         fileClose,
+        fileCloseNoSave,
         fileRecentClear,
         fileExit,
         fileExitNoSave,
@@ -117,6 +118,8 @@ private:
         viewZoomOut,
         viewZoomFit,
         viewShowCorrectionList,
+        viewShowTrackList,
+        viewShowUndoHistory,
         viewShowSpectrogram,
         viewToggleSpectral,
 
@@ -160,6 +163,9 @@ private:
     struct SpectrogramWindow;
     juce::Component::SafePointer<juce::Component> spectrogramWindow;
     juce::Component::SafePointer<juce::Component> audioSettingsWindow;
+    juce::Component::SafePointer<juce::Component> processingSettingsWindow;
+    juce::Component::SafePointer<juce::Component> recordingSettingsWindow;
+    juce::Component::SafePointer<juce::Component> documentationWindow;
     bool isSettingsVisible = false;
 
     //==============================================================================
@@ -176,17 +182,21 @@ private:
     juce::AudioDeviceManager audioDeviceManager;
     juce::AudioSourcePlayer audioSourcePlayer;
     std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
+    class BufferAudioSource;
+    std::unique_ptr<BufferAudioSource> bufferSource;
     juce::AudioTransportSource transportSource;
     class AudioRecorder;
     std::unique_ptr<AudioRecorder> recorder;
     bool isPlaying = false;
     bool isRecording = false;
+    bool isRecordingPaused = false;
     bool monitoringEnabled = true;
     juce::MemoryBlock bufferedRecording;
     float meterLevelLeft = 0.0f;
     float meterLevelRight = 0.0f;
     bool showCorrectionList = true;
     bool showTrackList = true;
+    bool showUndoHistory = true;
     bool quitAfterExport = false;
     juce::TooltipWindow tooltipWindow {this, 500};
     bool aiDenoiseEnabled = false;
@@ -194,6 +204,7 @@ private:
     void showAudioSettings();
     void showProcessingSettings();
     void showRecordingSettings();
+    void showDocumentation();
     void showMetadataEditor();
     void setUIScale (float newScale);
     void applyDenoiserSettings();
@@ -231,7 +242,6 @@ private:
     NoiseReduction noiseReductionProcessor;
     FilterBank filterBankProcessor;
     TrackDetector trackDetector;
-    class BufferAudioSource;
     class RestorationAudioSource;
     std::unique_ptr<juce::AudioSource> restorationSource;
     OnnxDenoiser realtimeDenoiser;
@@ -329,7 +339,8 @@ private:
  */
 class StandaloneWindow::MainComponent : public juce::Component,
                                         public juce::Button::Listener,
-                                        public juce::Slider::Listener
+                                        public juce::Slider::Listener,
+                                        public juce::FileDragAndDropTarget
 {
 public:
     MainComponent (AudioUndoManager& undoMgr);
@@ -341,6 +352,10 @@ public:
     void buttonClicked (juce::Button* button) override;
     void sliderValueChanged (juce::Slider* slider) override;
     void mouseWheelMove (const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
+
+    // FileDragAndDropTarget overrides
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
 
     // Keyboard handling for spacebar play/pause
     bool keyPressed (const juce::KeyPress& key) override;
@@ -362,13 +377,16 @@ public:
     juce::Button& getToolbarSpectrumButton() { return toolbarSpectrumButton; }
     juce::Button& getToolbarSettingsButton() { return toolbarSettingsButton; }
     juce::Button& getMonitorButton() { return monitorButton; }
-    juce::Button& getPlayPauseButton() { return playPauseButton; }
+    juce::Button& getPlayButton() { return playButton; }
+    juce::Button& getPauseButton() { return pauseButton; }
     juce::Button& getStopButton() { return stopButton; }
 
     void setAudioBuffer (const juce::AudioBuffer<float>* buffer, double sampleRate);
     void updatePlaybackPosition (double position);
     void setMeterLevel (float leftLevel, float rightLevel);
     void setCorrectionListVisible (bool visible);
+    void setTrackListVisible (bool visible);
+    void setUndoHistoryVisible (bool visible);
     void setRecording (bool recording);
     void setTransportTime (double seconds);
 
@@ -381,14 +399,15 @@ private:
     juce::TabbedComponent listTabs { juce::TabbedButtonBar::TabsAtTop };
 
     // Transport controls (retro cassette deck style)
-    juce::TextButton rewindButton {"<<"};
-    juce::TextButton playPauseButton {"Play"};  // Toggle between Play and Pause
-    juce::TextButton stopButton {"Stop"};
-    juce::TextButton recordButton {"Rec"};
+    juce::TextButton recordButton { juce::String::fromUTF8("\xe2\x8f\xba") }; // ⏺
+    juce::TextButton playButton { juce::String::fromUTF8("\xe2\x96\xb6") };   // ▶
+    juce::TextButton rewindButton { juce::String::fromUTF8("\xe2\x8f\xaa") }; // ⏪
+    juce::TextButton forwardButton { juce::String::fromUTF8("\xe2\x8f\xa9") };// ⏩
+    juce::TextButton stopButton { juce::String::fromUTF8("\xe2\x8f\xb9") };   // ⏹
+    juce::TextButton pauseButton { juce::String::fromUTF8("\xe2\x8f\xb8") };  // ⏸
     juce::ToggleButton monitorButton {"Mon"};
     juce::TextButton addMarkerButton {"+Track"};
     juce::TextButton delMarkerButton {"-Track"};
-    juce::TextButton forwardButton {">>"};
     juce::ToggleButton loopSelectionButton {"Loop Sel"};
     juce::TextButton zoomToSelectionButton {"Zoom Sel"};
     juce::Slider positionSlider;
