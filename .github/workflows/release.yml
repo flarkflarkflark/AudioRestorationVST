@@ -201,6 +201,8 @@ jobs:
         with:
           files: |
             release-files/*.zip
+            release-files/*.dmg
+            release-files/*.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
