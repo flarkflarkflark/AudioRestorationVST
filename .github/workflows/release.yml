@@ -135,7 +135,7 @@ jobs:
             if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
                 INNER_BIN=$(find "$DEST" -type f -perm +111 ! -name "*.dylib" | head -1)
             else
-                INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -perm +111 \) ! -name "*.dylib" | head -1)
+                INNER_BIN=$(find "$DEST" -type f \( -name "*.so" -o -executable \) ! -name "*.dylib" | head -1)
             fi
             
             if [ -n "$INNER_BIN" ]; then
