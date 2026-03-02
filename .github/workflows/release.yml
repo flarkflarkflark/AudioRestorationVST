@@ -141,7 +141,7 @@ jobs:
             if [ -n "$INNER_BIN" ]; then
               fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
             fi
-            cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-VST3.zip" "$(basename "$DEST")" && cd ..
+            (cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-VST3.zip" "$(basename "$DEST")")
           fi
 
           # Process Standalone
@@ -181,7 +181,7 @@ jobs:
                printf "[Desktop Entry]\nType=Application\nName=Vinyl Restoration Suite\nExec=vrs-standalone\nIcon=vrs\nCategories=AudioVideo;Audio;\n" > AppDir/vrs.desktop
                
                # Download appimagetool and run with extract-and-run for CI
-               wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
+               wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
                chmod +x appimagetool-x86_64.AppImage
                ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir "release-files/AudioRestoration-Linux-$VERSION-Portable.AppImage"
                
@@ -193,7 +193,7 @@ jobs:
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" "$DEST_PATH/"
                [ -d "$STANDALONE_DIR/kernels" ] && cp -R "$STANDALONE_DIR/kernels" "$DEST_PATH/"
                fix_deps "$DEST_PATH/$(basename "$STANDALONE")" "$LIB_NAME" "$LIB_PATTERN"
-               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-Standalone.zip" "$(basename "$DEST_PATH")" && cd ..
+               (cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-Standalone.zip" "$(basename "$DEST_PATH")")
             fi
           fi
 
