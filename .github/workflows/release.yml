@@ -154,17 +154,15 @@ jobs:
                
                # Create DMG for macOS
                npm install -g appdmg
-               cat > appdmg.json <<EOF
-               {
-                 "title": "Vinyl Restoration Suite",
-                 "icon": "VRSlogo.png",
-                 "background": "",
-                 "contents": [
-                   { "x": 448, "y": 156, "type": "link", "path": "/Applications" },
-                   { "x": 192, "y": 156, "type": "file", "path": "$DEST_PATH" }
+               echo "{
+                 \"title\": \"Vinyl Restoration Suite\",
+                 \"icon\": \"VRSlogo.png\",
+                 \"background\": \"\",
+                 \"contents\": [
+                   { \"x\": 448, \"y\": 156, \"type\": \"link\", \"path\": \"/Applications\" },
+                   { \"x\": 192, \"y\": 156, \"type\": \"file\", \"path\": \"$DEST_PATH\" }
                  ]
-               }
-EOF
+               }" > appdmg.json
                appdmg appdmg.json "release-files/AudioRestoration-macOS-Portable.dmg"
             else
                # Linux AppImage creation
@@ -186,14 +184,12 @@ EOF
                cp VRSlogo.png AppDir/usr/share/icons/hicolor/256x256/apps/vrs.png
                cp VRSlogo.png AppDir/vrs.png
                
-               cat > AppDir/vrs.desktop <<EOF
-[Desktop Entry]
+               echo "[Desktop Entry]
 Type=Application
 Name=Vinyl Restoration Suite
 Exec=vrs-standalone
 Icon=vrs
-Categories=AudioVideo;Audio;
-EOF
+Categories=AudioVideo;Audio;" > AppDir/vrs.desktop
                
                # Download appimagetool
                wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
