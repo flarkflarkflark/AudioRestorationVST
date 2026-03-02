@@ -153,10 +153,11 @@ jobs:
                INNER_BIN=$(find "$DEST_PATH" -type f -perm +111 ! -name "*.dylib" | head -1)
                fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
                
-               # Create DMG for macOS
-               npm install -g appdmg
-               printf '{\n  "title": "Vinyl Restoration Suite",\n  "icon": "VRSlogo.png",\n  "background": "",\n  "contents": [\n    { "x": 448, "y": 156, "type": "link", "path": "/Applications" },\n    { "x": 192, "y": 156, "type": "file", "path": "%s" }\n  ]\n}\n' "$DEST_PATH" > appdmg.json
-               appdmg appdmg.json "release-files/AudioRestoration-macOS-$VERSION-Portable.dmg"
+               # Create DMG for macOS using native hdiutil
+               mkdir -p dmg-root
+               cp -R "$DEST_PATH" dmg-root/
+               ln -s /Applications dmg-root/Applications
+               hdiutil create -volname "Vinyl Restoration Suite" -srcfolder dmg-root -ov -format UDZO "release-files/AudioRestoration-macOS-$VERSION-Portable.dmg"
             else
                # Linux AppImage creation
                mkdir -p AppDir/usr/bin
@@ -179,10 +180,10 @@ jobs:
                
                printf "[Desktop Entry]\nType=Application\nName=Vinyl Restoration Suite\nExec=vrs-standalone\nIcon=vrs\nCategories=AudioVideo;Audio;\n" > AppDir/vrs.desktop
                
-               # Download appimagetool
+               # Download appimagetool and run with extract-and-run for CI
                wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
                chmod +x appimagetool-x86_64.AppImage
-               ./appimagetool-x86_64.AppImage AppDir "release-files/AudioRestoration-Linux-$VERSION-Portable.AppImage"
+               ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir "release-files/AudioRestoration-Linux-$VERSION-Portable.AppImage"
                
                # Still create the old zip as fallback
                DEST_NAME="AudioRestoration-$DISPLAY_NAME-Standalone"
@@ -192,7 +193,7 @@ jobs:
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" "$DEST_PATH/"
                [ -d "$STANDALONE_DIR/kernels" ] && cp -R "$STANDALONE_DIR/kernels" "$DEST_PATH/"
                fix_deps "$DEST_PATH/$(basename "$STANDALONE")" "$LIB_NAME" "$LIB_PATTERN"
-               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so* && cd ..
+               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-Standalone.zip" "$(basename "$DEST_PATH")" && cd ..
             fi
           fi
 
