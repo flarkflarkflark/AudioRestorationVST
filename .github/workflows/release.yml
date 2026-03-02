@@ -76,7 +76,7 @@ jobs:
         run: cmake --build build --config Release
 
       # ===== Linux + macOS: Collect, Fix, and Zip =====
-      - name: Collect and Zip plugin/standalone (Linux/macOS)
+      - name: Collect and Package (Linux/macOS)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -145,29 +145,71 @@ jobs:
 
           # Process Standalone
           if [ -n "$STANDALONE" ]; then
-            DEST_NAME="AudioRestoration-$DISPLAY_NAME-Standalone"
-            if [[ "$STANDALONE" == *.app ]]; then
+            if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+               DEST_NAME="AudioRestoration-macOS-Standalone"
                DEST_PATH="release-files/$DEST_NAME.app"
                cp -R "$STANDALONE" "$DEST_PATH"
                INNER_BIN=$(find "$DEST_PATH" -type f -perm +111 ! -name "*.dylib" | head -1)
                fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
+               
+               # Create DMG for macOS
+               npm install -g appdmg
+               cat > appdmg.json <<EOF
+               {
+                 "title": "Vinyl Restoration Suite",
+                 "icon": "VRSlogo.png",
+                 "background": "",
+                 "contents": [
+                   { "x": 448, "y": 156, "type": "link", "path": "/Applications" },
+                   { "x": 192, "y": 156, "type": "file", "path": "$DEST_PATH" }
+                 ]
+               }
+EOF
+               appdmg appdmg.json "release-files/AudioRestoration-macOS-Portable.dmg"
             else
+               # Linux AppImage creation
+               mkdir -p AppDir/usr/bin
+               mkdir -p AppDir/usr/share/applications
+               mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+               
+               cp "$STANDALONE" AppDir/usr/bin/vrs-standalone
+               STANDALONE_DIR=$(dirname "$STANDALONE")
+               [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" AppDir/usr/bin/
+               
+               # Fix deps in AppDir
+               local lib_dir=$(find build -name "$LIB_NAME" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
+               if [ -n "$lib_dir" ]; then
+                 cp -P "$lib_dir"/$LIB_PATTERN AppDir/usr/bin/
+                 patchelf --set-rpath '$ORIGIN' AppDir/usr/bin/vrs-standalone
+               fi
+               
+               cp VRSlogo.png AppDir/usr/share/icons/hicolor/256x256/apps/vrs.png
+               cp VRSlogo.png AppDir/vrs.png
+               
+               cat > AppDir/vrs.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=Vinyl Restoration Suite
+Exec=vrs-standalone
+Icon=vrs
+Categories=AudioVideo;Audio;
+EOF
+               
+               # Download appimagetool
+               wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
+               chmod +x appimagetool-x86_64.AppImage
+               ./appimagetool-x86_64.AppImage AppDir "release-files/AudioRestoration-Linux-Portable.AppImage"
+               
+               # Still create the old zip as fallback
+               DEST_NAME="AudioRestoration-$DISPLAY_NAME-Standalone"
                DEST_PATH="release-files/$DEST_NAME-Binary"
                mkdir -p "$DEST_PATH"
                cp "$STANDALONE" "$DEST_PATH/"
-               STANDALONE_DIR=$(dirname "$STANDALONE")
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" "$DEST_PATH/"
                [ -d "$STANDALONE_DIR/kernels" ] && cp -R "$STANDALONE_DIR/kernels" "$DEST_PATH/"
                fix_deps "$DEST_PATH/$(basename "$STANDALONE")" "$LIB_NAME" "$LIB_PATTERN"
+               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so* && cd ..
             fi
-            
-            cd release-files
-            if [[ "${{ matrix.os }}" == "ubuntu-latest" && "$STANDALONE" != *.app ]]; then
-               zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so*
-            else
-               zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")"
-            fi
-            cd ..
           fi
 
       - name: Upload Release Assets (Linux/macOS)
