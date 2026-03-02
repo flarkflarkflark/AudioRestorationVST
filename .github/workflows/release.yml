@@ -81,6 +81,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-files
+          VERSION=${{ github.ref_name }}
 
           echo "=== Searching for VST3 and Standalone ==="
           PLUGIN=$(find build -name "*.vst3" | head -1)
@@ -140,7 +141,7 @@ jobs:
             if [ -n "$INNER_BIN" ]; then
               fix_deps "$INNER_BIN" "$LIB_NAME" "$LIB_PATTERN"
             fi
-            cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-VST3.zip" "$(basename "$DEST")" && cd ..
+            cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-VST3.zip" "$(basename "$DEST")" && cd ..
           fi
 
           # Process Standalone
@@ -155,7 +156,7 @@ jobs:
                # Create DMG for macOS
                npm install -g appdmg
                printf '{\n  "title": "Vinyl Restoration Suite",\n  "icon": "VRSlogo.png",\n  "background": "",\n  "contents": [\n    { "x": 448, "y": 156, "type": "link", "path": "/Applications" },\n    { "x": 192, "y": 156, "type": "file", "path": "%s" }\n  ]\n}\n' "$DEST_PATH" > appdmg.json
-               appdmg appdmg.json "release-files/AudioRestoration-macOS-Portable.dmg"
+               appdmg appdmg.json "release-files/AudioRestoration-macOS-$VERSION-Portable.dmg"
             else
                # Linux AppImage creation
                mkdir -p AppDir/usr/bin
@@ -181,7 +182,7 @@ jobs:
                # Download appimagetool
                wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
                chmod +x appimagetool-x86_64.AppImage
-               ./appimagetool-x86_64.AppImage AppDir "release-files/AudioRestoration-Linux-Portable.AppImage"
+               ./appimagetool-x86_64.AppImage AppDir "release-files/AudioRestoration-Linux-$VERSION-Portable.AppImage"
                
                # Still create the old zip as fallback
                DEST_NAME="AudioRestoration-$DISPLAY_NAME-Standalone"
@@ -191,7 +192,7 @@ jobs:
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" "$DEST_PATH/"
                [ -d "$STANDALONE_DIR/kernels" ] && cp -R "$STANDALONE_DIR/kernels" "$DEST_PATH/"
                fix_deps "$DEST_PATH/$(basename "$STANDALONE")" "$LIB_NAME" "$LIB_PATTERN"
-               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so* && cd ..
+               cd release-files && zip -r "AudioRestoration-$DISPLAY_NAME-$VERSION-Standalone.zip" "$(basename "$DEST_PATH")" libonnxruntime.so* && cd ..
             fi
           fi
 
@@ -212,6 +213,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release-files -Force | Out-Null
+          $version = "${{ github.ref_name }}"
           
           Write-Host "=== Searching for VST3 and Standalone ==="
           
@@ -231,7 +233,8 @@ jobs:
             Write-Host "Found plugin: $($plugin.FullName)"
             $destVstDir = "release-files/VST3"
             New-Item -ItemType Directory -Path $destVstDir -Force | Out-Null
-            $destVst = Join-Path $destVstDir "AudioRestoration-Windows.vst3"
+            $destVstName = "AudioRestoration-Windows.vst3"
+            $destVst = Join-Path $destVstDir $destVstName
             Copy-Item -Path $plugin.FullName -Destination $destVst -Recurse -Force
             
             # Ensure DLLs and models are also in the VST3 if they are alongside it
@@ -240,9 +243,9 @@ jobs:
                 Copy-Item -Path $_.FullName -Destination $destVst -Recurse -Force
             }
             
-            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-VST3.zip"
+            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-$version-VST3.zip"
             Push-Location $destVstDir
-            Compress-Archive -Path "AudioRestoration-Windows.vst3" -DestinationPath $zipPath -Force
+            Compress-Archive -Path $destVstName -DestinationPath $zipPath -Force
             Pop-Location
           } else {
             Write-Warning "Plugin NOT found!"
@@ -261,7 +264,7 @@ jobs:
             # Copy EVERYTHING from the folder where the .exe lives (DLLs, models, kernels)
             Copy-Item -Path "$standaloneDir\*" -Destination $destDir -Recurse -Force
             
-            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-Standalone.zip"
+            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-$version-Standalone.zip"
             Push-Location $destBaseDir
             Compress-Archive -Path $destDirName -DestinationPath $zipPath -Force
             Pop-Location
