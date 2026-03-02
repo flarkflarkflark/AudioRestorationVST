@@ -59,6 +59,7 @@ jobs:
             patchelf
 
       - name: Configure CMake
+        shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             cmake -B build -DCMAKE_BUILD_TYPE=Release \
@@ -71,11 +72,13 @@ jobs:
           fi
 
       - name: Build
+        shell: bash
         run: cmake --build build --config Release
 
       # ===== Linux + macOS: Collect, Fix, and Zip =====
       - name: Collect and Zip plugin/standalone (Linux/macOS)
         if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
           mkdir -p release-files
 
@@ -169,7 +172,7 @@ jobs:
 
       - name: Upload Release Assets (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             release-files/*.zip
@@ -184,40 +187,64 @@ jobs:
           New-Item -ItemType Directory -Path release-files -Force | Out-Null
           
           Write-Host "=== Searching for VST3 and Standalone ==="
-          $plugin = Get-ChildItem -Recurse build -Include *.vst3 | Select-Object -First 1
-          # Look for .exe in Standalone_artefacts directory to be more precise
-          $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { ($_.FullName -like "*Standalone_artefacts*") -and ($_.Name -notlike "*cmake*") } | Select-Object -First 1
           
+          # Find VST3 - search specifically in artefacts dir first
+          $plugin = Get-ChildItem -Recurse build -Directory -Filter "*.vst3" | Where-Object { $_.FullName -like "*_artefacts*" } | Select-Object -First 1
+          if (-not $plugin) {
+            $plugin = Get-ChildItem -Recurse build -Directory -Filter "*.vst3" | Select-Object -First 1
+          }
+
+          # Find Standalone EXE - search specifically in Standalone_artefacts dir
+          $standalone = Get-ChildItem -Recurse build -Include "*.exe" | Where-Object { ($_.FullName -like "*Standalone_artefacts*") -and ($_.Name -notlike "*cmake*") } | Select-Object -First 1
           if (-not $standalone) {
-            # Fallback search if artefacts dir not found
-            $standalone = Get-ChildItem -Recurse build -Include *.exe | Where-Object { ($_.Name -like "*Vinyl*Restoration*Suite*") -and ($_.Name -notlike "*cmake*") -and ($_.Name -notlike "*vst3*") } | Select-Object -First 1
+            $standalone = Get-ChildItem -Recurse build -Include "*.exe" | Where-Object { ($_.Name -like "*Vinyl*Restoration*Suite*") -and ($_.Name -notlike "*cmake*") -and ($_.Name -notlike "*vst3*") } | Select-Object -First 1
           }
 
-          Write-Host "Found plugin: $($plugin.FullName)"
-          Write-Host "Found standalone: $($standalone.FullName)"
-          
-          # Copy and Zip VST3
           if ($plugin) {
-            $destVst = "release-files/AudioRestoration-Windows.vst3"
-            Copy-Item $plugin.FullName -Destination $destVst -Recurse -Force
-            $zipPath = "release-files/AudioRestoration-Windows-VST3.zip"
-            Compress-Archive -Path $destVst -DestinationPath $zipPath -Force
+            Write-Host "Found plugin: $($plugin.FullName)"
+            $destVstDir = "release-files/VST3"
+            New-Item -ItemType Directory -Path $destVstDir -Force | Out-Null
+            $destVst = Join-Path $destVstDir "AudioRestoration-Windows.vst3"
+            Copy-Item -Path $plugin.FullName -Destination $destVst -Recurse -Force
+            
+            # Ensure DLLs and models are also in the VST3 if they are alongside it
+            $pluginDir = Split-Path $plugin.FullName
+            Get-ChildItem -Path "$pluginDir\*" -Include "*.dll", "models" -Recurse | ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination $destVst -Recurse -Force
+            }
+            
+            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-VST3.zip"
+            Push-Location $destVstDir
+            Compress-Archive -Path "AudioRestoration-Windows.vst3" -DestinationPath $zipPath -Force
+            Pop-Location
+          } else {
+            Write-Warning "Plugin NOT found!"
           }
 
-          # Copy and Zip Standalone
           if ($standalone) {
-            $destDir = "release-files/AudioRestoration-Windows-Standalone"
+            Write-Host "Found standalone: $($standalone.FullName)"
+            $destBaseDir = "release-files/Standalone"
+            New-Item -ItemType Directory -Path $destBaseDir -Force | Out-Null
+            $destDirName = "AudioRestoration-Windows-Standalone"
+            $destDir = Join-Path $destBaseDir $destDirName
             New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            
             $standaloneDir = Split-Path $standalone.FullName
+            
             # Copy EVERYTHING from the folder where the .exe lives (DLLs, models, kernels)
             Copy-Item -Path "$standaloneDir\*" -Destination $destDir -Recurse -Force
-            $zipPath = "release-files/AudioRestoration-Windows-Standalone.zip"
-            Compress-Archive -Path $destDir -DestinationPath $zipPath -Force
+            
+            $zipPath = Join-Path (Get-Location) "release-files/AudioRestoration-Windows-Standalone.zip"
+            Push-Location $destBaseDir
+            Compress-Archive -Path $destDirName -DestinationPath $zipPath -Force
+            Pop-Location
+          } else {
+            Write-Warning "Standalone NOT found!"
           }
 
       - name: Upload Release Assets (Windows)
         if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             release-files/*.zip
