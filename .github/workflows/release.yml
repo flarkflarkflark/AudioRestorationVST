@@ -169,9 +169,9 @@ jobs:
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" AppDir/usr/bin/
                
                # Fix deps in AppDir
-               local lib_dir=$(find build -name "$LIB_NAME" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
-               if [ -n "$lib_dir" ]; then
-                 cp -P "$lib_dir"/$LIB_PATTERN AppDir/usr/bin/
+               LIB_DIR=$(find build -name "$LIB_NAME" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
+               if [ -n "$LIB_DIR" ]; then
+                 cp -P "$LIB_DIR"/$LIB_PATTERN AppDir/usr/bin/
                  patchelf --set-rpath '$ORIGIN' AppDir/usr/bin/vrs-standalone
                fi
                
