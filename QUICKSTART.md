@@ -2,78 +2,48 @@
 
 ## Initial Setup
 
-1. **Get JUCE Framework**
+1. **Clone with Submodules**
    ```bash
-   cd /mnt/PRODUCTION/PROGRAMS/AudioRestorationVST
-   git init
-   git submodule add -b master https://github.com/juce-framework/JUCE.git JUCE
-   git submodule update --init --recursive
+   git clone --recursive https://github.com/flarkflarkflark/AudioRestorationVST.git
+   cd AudioRestorationVST
    ```
 
 2. **Build the Project**
    ```bash
    mkdir build && cd build
-   cmake ..
+   cmake .. -DCMAKE_BUILD_TYPE=Release
    cmake --build . --config Release
    ```
 
-3. **Optional: MP3 support (vcpkg)**
+3. **Optional: MP3 support (vcpkg Windows)**
    ```bash
    set VCPKG_ROOT=C:\path\to\vcpkg
    powershell -ExecutionPolicy Bypass -File tools\install_vcpkg_mp3.ps1
    cmake .. -DVRS_USE_VCPKG=ON -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
    ```
 
-3. **Test the Plugin**
-   - **VST3**: Copy from `build/AudioRestoration_artefacts/Release/VST3/` to your VST3 folder
-   - **Standalone**: Run `build/AudioRestoration_artefacts/Release/Standalone/Audio Restoration`
+## Installation
 
-## Development Workflow
+- **VST3**: Copy from `build/VinylRestorationSuite_artefacts/Release/VST3/` to your system VST3 folder.
+- **Standalone**: Run the executable in `build/VinylRestorationSuiteStandalone_artefacts/Release/`.
 
-### Making Changes
-1. Edit source files in `Source/`
-2. Rebuild: `cd build && cmake --build . --config Release`
-3. Test in standalone or DAW
+## Restoring Vinyl: Workflow
 
-### Adding DSP Features
-1. Edit DSP classes in `Source/DSP/`
-2. Key areas to implement:
-   - `ClickRemoval.cpp`: Complete detection and removal algorithms
-   - `NoiseReduction.cpp`: Implement spectral subtraction
-   - `FilterBank.cpp`: Already functional, can add more filters
+1. **Import/Record**: Drag an audio file into the standalone window or use the Record button to capture a transfer.
+2. **Click Removal**: Adjust the **Sensitivity** knob. Use **Difference Mode** to ensure you're not removing musical transients.
+3. **AI Denoise**: Enable the AI denoiser for broadband surface noise. Choose the appropriate provider (CPU/DirectML) in Settings.
+4. **Spectral NR**: If specific noise patterns remain, use the **Capture Profile** button on a silent section and dial in the reduction.
+5. **EQ & Filters**: Use the **Rumble** filter for subsonic noise and the **Graphic EQ** to restore tonal balance.
+6. **Track Detection**: Click **Detect Tracks** to automatically find gaps between songs.
+7. **Export**: Export individual tracks or the entire restored file.
 
-### Testing Click Removal
-The click removal includes your Reaper crossfade technique:
-- `CrossfadeSmoothing` mode: Short fade in/out around click (like your manual method)
-- `SplineInterpolation` mode: Cubic spline for larger clicks
-- `Automatic` mode: Chooses best method based on click size
+## Key restoration techniques
 
-## Current Status
-
-**Working:**
-- Basic VST3 and Standalone compilation structure
-- Parameter management (all controls connected)
-- Filter bank (rumble, hum, 10-band EQ)
-- GUI with all controls laid out
-
-**Needs Implementation:**
-- [ ] Click detection algorithm
-- [ ] Cubic spline interpolation (currently uses linear)
-- [ ] Spectral noise reduction (FFT processing)
-- [ ] Waveform display (standalone)
-- [ ] Batch processing (standalone)
-- [ ] Session save/load (standalone)
-
-## Next Steps
-
-1. **Implement click removal algorithm** in `Source/DSP/ClickRemoval.cpp`
-2. **Implement noise reduction** in `Source/DSP/NoiseReduction.cpp`
-3. **Test with real audio** containing clicks and noise
-4. **Add waveform display** for standalone mode
-5. **Implement batch processing** for multiple files
+- **Crossfade Smoothing**: Replicates the manual Reaper crossfade technique for a seamless, natural repair of small clicks.
+- **Difference Mode**: ALWAYS use this to check your work. If you hear music in the difference signal, back off the sensitivity.
+- **AI Acceleration**: On Windows, use the **DirectML** provider in AI settings to leverage your GPU/NPU for lower CPU load.
 
 ## Getting Help
 
-- See `CLAUDE.md` for detailed architecture and development guide
-- JUCE documentation: https://docs.juce.com/
-- JUCE forum: https://forum.juce.com/
+- See `CLAUDE.md` for technical details and architecture.
+- Follow development on [GitHub](https://github.com/flarkflarkflark/AudioRestorationVST).
