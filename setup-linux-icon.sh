@@ -14,7 +14,7 @@ cp VRSlogo.png "$ICON_PATH"
 # Maak het .desktop bestand aan
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
-Version=1.6.27
+Version=1.6.32
 Type=Application
 Name=Vinyl Restoration Suite
 Comment=Professional Audio Restoration
