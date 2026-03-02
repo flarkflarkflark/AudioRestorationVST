@@ -13,7 +13,7 @@ public:
     VinylRestorationApplication() {}
 
     const juce::String getApplicationName() override       { return "Vinyl Restoration Suite"; }
-    const juce::String getApplicationVersion() override    { return "1.6.35"; }
+    const juce::String getApplicationVersion() override    { return "1.6.36"; }
     bool moreThanOneInstanceAllowed() override             { return true; }
 
     //==============================================================================

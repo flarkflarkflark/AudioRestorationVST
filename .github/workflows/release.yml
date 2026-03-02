@@ -161,6 +161,7 @@ jobs:
             else
                # Linux AppImage creation
                mkdir -p AppDir/usr/bin
+               mkdir -p AppDir/usr/lib
                mkdir -p AppDir/usr/share/applications
                mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
                
@@ -168,12 +169,13 @@ jobs:
                STANDALONE_DIR=$(dirname "$STANDALONE")
                [ -d "$STANDALONE_DIR/models" ] && cp -R "$STANDALONE_DIR/models" AppDir/usr/bin/
                
-               # Fix deps in AppDir
-               LIB_DIR=$(find build -name "$LIB_NAME" -exec dirname {} \; | grep "onnxruntime/lib" | head -1)
-               if [ -n "$LIB_DIR" ]; then
-                 cp -P "$LIB_DIR"/$LIB_PATTERN AppDir/usr/bin/
-                 patchelf --set-rpath '$ORIGIN' AppDir/usr/bin/vrs-standalone
-               fi
+               # Collect and bundle dependencies
+               echo "=== Bundling dependencies ==="
+               cp "$STANDALONE_DIR"/*.so* AppDir/usr/lib/ || true
+               
+               # Fix deps in AppDir using patchelf
+               find AppDir/usr/bin -type f -executable | xargs -I {} patchelf --set-rpath '$ORIGIN/../lib' {}
+               find AppDir/usr/lib -name "*.so*" | xargs -I {} patchelf --set-rpath '$ORIGIN' {}
                
                cp VRSlogo.png AppDir/usr/share/icons/hicolor/256x256/apps/vrs.png
                cp VRSlogo.png AppDir/vrs.png

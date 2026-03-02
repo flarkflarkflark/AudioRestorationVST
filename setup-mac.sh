@@ -35,5 +35,5 @@ cmake --build . --config Release --parallel $(sysctl -n hw.ncpu)
 echo "--------------------------------------------------------"
 echo "Build complete!"
 echo "Standalone App: build-mac/VinylRestorationSuiteStandalone_artefacts/Release/Vinyl Restoration Suite.app"
-echo "VST3 Plugin:    build-mac/VinylRestorationSuite_artefacts/Release/VST3/Vinyl Restoration Suite v1.6.35.vst3"
+echo "VST3 Plugin:    build-mac/VinylRestorationSuite_artefacts/Release/VST3/Vinyl Restoration Suite v1.6.36.vst3"
 echo "--------------------------------------------------------"
